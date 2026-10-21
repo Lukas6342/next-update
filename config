@@ -1,4 +1,4 @@
-# /etc/next-update/config  (sourced as bash, keep it root-only: chmod 600)
+# /etc/next-update/config  (sourced as bash, root only)
 
 # Run updates every time the daemon starts (i.e. on boot): yes / no
 RUN_ON_BOOT=yes
@@ -13,15 +13,8 @@ UPDATE_DAYS="all"
 STOP_ON_ERROR=no
 
 # Commands, executed in order, each via `bash -c`.
-export DEBIAN_FRONTEND=noninteractive
 COMMANDS=(
-    "apt-get update"
-    "apt-get -y upgrade"
-    "apt-get -y autoremove"
+    "pacman -Syu --noconfirm"
 )
 
-# Other examples:
-# COMMANDS=("dnf -y upgrade")
-# COMMANDS=("pacman -Syu --noconfirm")
-# COMMANDS=("zypper -n dup")
 # Reboot after updating: add "systemctl reboot" as last command.

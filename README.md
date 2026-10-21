@@ -1,17 +1,19 @@
 # next-update
-An auto update daemon for GNU/Linux servers (systemd).
+An auto update daemon for Arch-based GNU/Linux servers (systemd, pacman package).
 
 Runs your update commands on every start (boot) and/or at a fixed time of day / on fixed weekdays.
 
 ## Install
 ```
-sudo ./install.sh
+git clone https://github.com/Lukas6342/next-update
+cd next-update
+makepkg -si
 sudo $EDITOR /etc/next-update/config
-sudo systemctl start next-update
+sudo systemctl enable --now next-update
 ```
 
 ## Config
-`/etc/next-update/config` (bash syntax, see `config.example`):
+`/etc/next-update/config` (bash syntax, kept on package upgrades via pacman's backup mechanism):
 
 | Option | Meaning |
 |---|---|

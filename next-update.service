@@ -5,7 +5,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/next-update
+ExecStart=/usr/bin/next-update
 Restart=on-failure
 RestartSec=60
 SyslogIdentifier=next-update
