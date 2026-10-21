@@ -1,7 +1,7 @@
 # Maintainer: Lukas6342
 pkgbase=next-update
 pkgname=('next-update' 'next-update-server')
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 arch=('any')
 url='https://github.com/Lukas6342/next-update'
@@ -14,6 +14,10 @@ sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 package_next-update() {
     pkgdesc='Auto update daemon for servers (systemd), optionally managed by next-update-server'
     depends=('systemd' 'curl' 'pacman-contrib')
+    optdepends=('yay: AUR updates'
+                'docker: Docker image updates'
+                'docker-buildx: detect Docker image updates'
+                'docker-compose: recreate compose containers after an image update')
     backup=('etc/next-update/config')
 
     install -Dm755 next-update "$pkgdir/usr/bin/next-update"

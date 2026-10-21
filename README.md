@@ -46,7 +46,9 @@ It then shows up in the UI by its hostname.
 | `SERVER_URL`, `SERVER_TOKEN` | link to next-update-server (optional) |
 | `HOST_NAME` | name in the UI, default: hostname |
 | `POLL_INTERVAL` | seconds between server polls, default 10 |
-| `CHECK_INTERVAL` | seconds between pending-update checks, default 900 |
+| `CHECK_INTERVAL` | seconds between pacman/AUR pending-update checks, default 900 |
+| `AUR_USER` | user that runs yay, empty = no AUR updates |
+| `DOCKER_CHECK`, `DOCKER_CHECK_INTERVAL` | Docker image checks, default `yes` / 21600 s |
 
 ### Holding packages
 Held packages (local `HOLD_PKGS` + holds set in the web UI, globally or per server) are passed to your commands
@@ -58,14 +60,34 @@ If you change `COMMANDS`, keep that part, otherwise holds are not applied.
 
 ## Web UI
 - Status of every server (online / offline / running), last seen
-- Pending updates (held packages are struck through)
+- Pending updates per server, grouped: **Pacman**, **AUR (yay)**, **Docker images** (held packages are struck through)
+- Tick single entries and press **Update selected**, or press **Update all** (runs the `COMMANDS` from the agent config)
 - Hold packages per server or on all servers
-- "Update now" starts a run within `POLL_INTERVAL` seconds
+- A request starts within `POLL_INTERVAL` seconds
 - Output of the last run
 
+### What "Update selected" does
+| Kind | Command run by the agent |
+|---|---|
+| Pacman | `pacman -Sy --noconfirm -- <packages>` |
+| AUR | `yay -S --noconfirm -- <packages>` as `AUR_USER` |
+| Docker | `docker pull <image>`, then `docker compose up -d --no-deps <service>` for every compose-managed container using the image. Containers not created by compose are only pulled, recreate them yourself. |
+
+**Pacman partial upgrades:** Arch does not support updating only some packages (`pacman -Sy` + a subset).
+Selecting a library without its dependents can break the system. The UI asks before you do it.
+Use "Update all" for normal maintenance.
+
+### AUR and Docker setup
+- AUR: install `yay`, set `AUR_USER` in the agent config. That user needs passwordless `sudo` for pacman.
+- Docker: install `docker-buildx` (used to read the registry digest) and `docker-compose`.
+  Only images of existing containers are checked. Locally built images and digest-pinned (`@sha256:`) images are skipped.
+  Registries are queried every `DOCKER_CHECK_INTERVAL` seconds (default 6 h) and after every update run,
+  because Docker Hub limits anonymous requests.
+
 ## Security
-- The server cannot run arbitrary commands on agents. It only sends "update now" and package names;
-  what runs is defined solely by the local `COMMANDS`.
+- The server cannot run arbitrary commands on agents. It only sends "update all" or a selection of names.
+  "Update all" runs only the local `COMMANDS`; for a selection the agent updates only items that are in its
+  own current pending list, so the server cannot make it install anything else.
 - Traffic is plain HTTP with a shared token. That is meant for a trusted home network.
   Put a reverse proxy with TLS in front of it if you need more.
 - Anyone with `ADMIN_PASSWORD` can trigger updates on all linked servers.

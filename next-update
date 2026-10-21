@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # next-update - auto update daemon for servers (systemd)
 # Logs go to stdout/stderr -> journalctl -u next-update
-# Optional: reports to / takes "update now" and package holds from next-update-server.
-# The server can never run arbitrary commands, only the ones in the local config.
+# Optional: reports to / takes "update now", selected updates and package holds from next-update-server.
+# The server can never run arbitrary commands: it only sends "run COMMANDS" or a selection of items,
+# and the agent only updates items that are in its own current pending list.
 
 set -u
 export LC_ALL=C
@@ -23,14 +24,20 @@ load_config() {
     HOST_NAME="$HOSTNAME"
     POLL_INTERVAL=10
     CHECK_INTERVAL=900
+    AUR_USER=""
+    DOCKER_CHECK=yes
+    DOCKER_CHECK_INTERVAL=21600
     [[ -r $CONFIG ]] || { err "config not readable: $CONFIG"; return 1; }
     # shellcheck source=/dev/null
     source "$CONFIG" || { err "config has errors: $CONFIG"; return 1; }
     ((${#COMMANDS[@]})) || { err "COMMANDS is empty in $CONFIG"; return 1; }
     [[ $POLL_INTERVAL =~ ^[0-9]+$ ]] && ((POLL_INTERVAL >= 2)) || POLL_INTERVAL=10
     [[ $CHECK_INTERVAL =~ ^[0-9]+$ ]] && ((CHECK_INTERVAL >= 60)) || CHECK_INTERVAL=900
+    [[ $DOCKER_CHECK_INTERVAL =~ ^[0-9]+$ ]] && ((DOCKER_CHECK_INTERVAL >= 600)) || DOCKER_CHECK_INTERVAL=21600
     SERVER_URL=${SERVER_URL%/}
 }
+
+# ---------------------------------------------------------------- full run (COMMANDS from config)
 
 run_updates() {
     local c rc failed=0
@@ -50,6 +57,8 @@ run_updates() {
     if ((failed)); then err "update run finished with errors"; else log "update run finished"; fi
     return $failed
 }
+
+# ---------------------------------------------------------------- schedule
 
 # epoch of the next matching day/time in the future
 next_epoch() {
@@ -71,46 +80,177 @@ next_epoch() {
     return 1
 }
 
-PENDING_FILE=$(mktemp)
-LOG_FILE=$(mktemp)
-trap 'rm -f "$PENDING_FILE" "$LOG_FILE"' EXIT
+# ---------------------------------------------------------------- pending updates
+# Files hold lines "kind<TAB>name<TAB>detail", kind = pacman | aur | docker
+
+PEND_DIR=$(mktemp -d)
+PEND_PACMAN=$PEND_DIR/pacman
+PEND_AUR=$PEND_DIR/aur
+PEND_DOCKER=$PEND_DIR/docker
+LOG_FILE=$PEND_DIR/log
+: >"$PEND_PACMAN"; : >"$PEND_AUR"; : >"$PEND_DOCKER"
+trap 'rm -rf "$PEND_DIR"' EXIT
+
 STATUS=idle
 SRV_HOLD=()
-SRV_RUN=0
+SRV_ITEMS=()
+SRV_RUN=0       # 0 = nothing, 1 = run COMMANDS, 2 = update selected items
 SRV_OK=1
+SEL=()
 last_check=0
+last_docker_check=0
 
-# list of pending updates (needs pacman-contrib for checkupdates, which does not touch the real db)
-refresh_pending() {
+# "pkg old -> new" -> "kind<TAB>pkg<TAB>old -> new"
+fmt_pkgs() { awk -v k="$1" 'NF >= 4 {printf "%s\t%s\t%s -> %s\n", k, $1, $2, $4}'; }
+
+# repo packages (checkupdates from pacman-contrib works on a temporary db copy)
+refresh_pacman() {
     local tmp rc
-    last_check=$(date +%s)
-    tmp=$(mktemp)
+    tmp=$(mktemp -p "$PEND_DIR")
     if command -v checkupdates >/dev/null; then
-        checkupdates >"$tmp" 2>/dev/null; rc=$?
-        ((rc == 0 || rc == 2)) && cp "$tmp" "$PENDING_FILE"   # 2 = nothing pending
+        checkupdates 2>/dev/null | fmt_pkgs pacman >"$tmp"; rc=${PIPESTATUS[0]}
+        ((rc == 0 || rc == 2)) && mv "$tmp" "$PEND_PACMAN"    # 2 = nothing pending
     elif command -v pacman >/dev/null; then
-        pacman -Qu >"$tmp" 2>/dev/null; rc=$?
-        ((rc == 0 || rc == 1)) && cp "$tmp" "$PENDING_FILE"
+        pacman -Qu 2>/dev/null | fmt_pkgs pacman >"$tmp"; rc=${PIPESTATUS[0]}
+        ((rc == 0 || rc == 1)) && mv "$tmp" "$PEND_PACMAN"
     fi
     rm -f "$tmp"
 }
 
-# tell the server we are alive + pending list, fetch holds and "run" requests
+# yay/makepkg refuse to run as root, so AUR work runs as AUR_USER
+as_aur() { runuser -u "$AUR_USER" -- env "HOME=$(getent passwd "$AUR_USER" | cut -d: -f6)" "$@"; }
+
+refresh_aur() {
+    local tmp rc
+    [[ -n $AUR_USER ]] && command -v yay >/dev/null || { : >"$PEND_AUR"; return; }
+    tmp=$(mktemp -p "$PEND_DIR")
+    as_aur yay -Qua 2>/dev/null | fmt_pkgs aur >"$tmp"; rc=${PIPESTATUS[0]}
+    ((rc == 0 || rc == 1)) && mv "$tmp" "$PEND_AUR"
+    rm -f "$tmp"
+}
+
+# names of containers (all states) created from exactly this image reference
+docker_containers_of() {
+    docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | awk -v i="$1" '$2 == i {print $1}'
+}
+
+# images of existing containers whose registry digest differs from the local one
+refresh_docker() {
+    local tmp img imgs remote names
+    last_docker_check=$(date +%s)
+    [[ $DOCKER_CHECK == yes ]] && command -v docker >/dev/null || { : >"$PEND_DOCKER"; return; }
+    docker info >/dev/null 2>&1 || return    # daemon down: keep the old list
+    tmp=$(mktemp -p "$PEND_DIR")
+    imgs=$(docker ps -a --format '{{.Image}}' 2>/dev/null | sort -u)
+    while read -r img; do
+        [[ $img =~ ^[A-Za-z0-9][A-Za-z0-9._/:-]*$ ]] || continue   # skips digest-pinned (@sha256) refs
+        [[ $img =~ ^[0-9a-f]{12,64}$ ]] && continue                 # bare image ids
+        remote=$(docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}' 2>/dev/null) || continue
+        [[ $remote == sha256:* ]] || continue
+        docker image inspect "$img" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+            | grep -q "@${remote}\$" && continue
+        names=$(docker_containers_of "$img" | paste -sd, -)
+        printf 'docker\t%s\tused by: %s\n' "$img" "$names" >>"$tmp"
+    done <<<"$imgs"
+    mv "$tmp" "$PEND_DOCKER"
+}
+
+refresh_fast() { refresh_pacman; refresh_aur; last_check=$(date +%s); }
+refresh_all() { refresh_fast; refresh_docker; }
+
+in_pending() {   # $1 kind, $2 name
+    awk -F'\t' -v k="$1" -v n="$2" '$1 == k && $2 == n {f = 1} END {exit !f}' \
+        "$PEND_PACMAN" "$PEND_AUR" "$PEND_DOCKER"
+}
+
+# ---------------------------------------------------------------- selected updates
+
+# pull the image, then recreate compose-managed containers that use it
+update_docker() {
+    local img=$1 c proj svc dir cfg f key rc=0 seen=""
+    local -a args files
+    log "docker: pulling $img"
+    docker pull "$img" </dev/null || return 1
+    while read -r c; do
+        proj=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c")
+        svc=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$c")
+        dir=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$c")
+        cfg=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$c")
+        if [[ -z $proj || -z $svc ]]; then
+            log "docker: container $c is not managed by compose - recreate it yourself to use the new image"
+            continue
+        fi
+        key="$proj/$svc"
+        [[ $seen == *"|$key|"* ]] && continue
+        seen+="|$key|"
+        args=(); files=()
+        IFS=, read -ra files <<<"$cfg"
+        for f in "${files[@]}"; do args+=(-f "$f"); done
+        log "docker: recreating $key"
+        docker compose --project-directory "$dir" -p "$proj" "${args[@]}" up -d --no-deps "$svc" </dev/null || rc=1
+    done < <(docker_containers_of "$img")
+    return $rc
+}
+
+# update only the items in SEL ("kind name"), each must be in our own pending list
+run_selected() {
+    local it kind name failed=0
+    local -a pm=() ar=() dk=()
+    for it in "${SEL[@]}"; do
+        kind=${it%% *}
+        name=${it#* }
+        if ! in_pending "$kind" "$name"; then
+            err "skipping $kind $name: not in this server's pending list"
+            continue
+        fi
+        case $kind in
+            pacman) pm+=("$name") ;;
+            aur) ar+=("$name") ;;
+            docker) dk+=("$name") ;;
+        esac
+    done
+    log "selective update run started"
+    if ((${#pm[@]})); then
+        log "pacman: ${pm[*]}"
+        pacman -Sy --noconfirm -- "${pm[@]}" </dev/null || { err "pacman failed"; failed=1; }
+    fi
+    if ((${#ar[@]})); then
+        log "aur: ${ar[*]}"
+        as_aur yay -S --noconfirm --answerdiff None --answerclean None --answeredit None -- "${ar[@]}" </dev/null \
+            || { err "yay failed"; failed=1; }
+    fi
+    for name in "${dk[@]}"; do
+        update_docker "$name" || { err "docker update failed: $name"; failed=1; }
+    done
+    if ((failed)); then err "selective update run finished with errors"; else log "selective update run finished"; fi
+    return $failed
+}
+
+# ---------------------------------------------------------------- server link
+
+# tell the server we are alive + pending list, fetch holds and run requests
 poll_server() {
-    local resp k v
-    resp=$(curl -fsS --max-time 10 -X POST \
+    local resp k v w
+    SRV_RUN=0
+    SRV_ITEMS=()
+    resp=$(cat "$PEND_PACMAN" "$PEND_AUR" "$PEND_DOCKER" | curl -fsS --max-time 10 -X POST \
         -H "Authorization: Bearer $SERVER_TOKEN" -H "X-Status: $STATUS" \
-        --data-binary @"$PENDING_FILE" \
-        "$SERVER_URL/api/poll?host=$HOST_NAME" 2>&1) || {
+        --data-binary @- "$SERVER_URL/api/poll?host=$HOST_NAME" 2>&1) || {
         if ((SRV_OK)); then err "server: ${resp:-request failed}"; SRV_OK=0; fi
         return 1
     }
     if ((!SRV_OK)); then log "server reachable again"; SRV_OK=1; fi
     SRV_HOLD=()
-    while read -r k v; do
+    while read -r k v w; do
         case $k in
-            hold) [[ $v =~ ^[A-Za-z0-9@._+-]+$ ]] && SRV_HOLD+=("$v") ;;
+            hold) [[ $v =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]] && SRV_HOLD+=("$v") ;;
             run) SRV_RUN=1 ;;
+            runsel) SRV_RUN=2 ;;
+            item)
+                if [[ $v =~ ^(pacman|aur)$ && $w =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]] \
+                    || [[ $v == docker && $w =~ ^[A-Za-z0-9][A-Za-z0-9._/:-]*$ ]]; then
+                    SRV_ITEMS+=("$v $w")
+                fi ;;
         esac
     done <<<"$resp"
     return 0
@@ -123,37 +263,38 @@ send_log() {
         || err "could not send log to server"
 }
 
+# $1 = function to run: run_updates | run_selected
 do_run() {
     local rc
     if [[ -n $SERVER_URL ]]; then
         STATUS=running
-        poll_server   # announce "running", get current holds
-        SRV_RUN=0     # a request that arrives now is covered by this run
+        poll_server   # announce "running" (the server hands out no requests then), fetch holds
     fi
     local all=("${HOLD_PKGS[@]}" "${SRV_HOLD[@]}")
     export NU_IGNORE
     NU_IGNORE=$(IFS=,; echo "${all[*]}")
     [[ -n $NU_IGNORE ]] && log "held packages: $NU_IGNORE"
 
-    run_updates 2>&1 | tee "$LOG_FILE"
+    "$1" 2>&1 | tee "$LOG_FILE"
     rc=${PIPESTATUS[0]}
 
     STATUS=idle
     if [[ -n $SERVER_URL ]]; then
-        refresh_pending
+        refresh_all
         send_log "$( ((rc)) && echo failed || echo ok )"
-        poll_server
     fi
 }
+
+# ---------------------------------------------------------------- main
 
 load_config || exit 1
 
 if [[ -n $SERVER_URL ]]; then
     log "server: $SERVER_URL as $HOST_NAME"
-    refresh_pending
+    refresh_all
     poll_server
 fi
-[[ $RUN_ON_BOOT == yes ]] && do_run
+[[ $RUN_ON_BOOT == yes ]] && do_run run_updates
 
 target=0
 sig=""
@@ -163,12 +304,18 @@ while true; do
     if [[ -n $SERVER_URL ]]; then
         poll_server
         if ((SRV_RUN)); then
-            SRV_RUN=0
-            log "update requested via server"
-            do_run
+            if ((SRV_RUN == 2)); then
+                SEL=("${SRV_ITEMS[@]}")
+                log "selective update requested via server (${#SEL[@]} items)"
+                do_run run_selected
+            else
+                log "update requested via server"
+                do_run run_updates
+            fi
             continue
         fi
-        (($(date +%s) - last_check >= CHECK_INTERVAL)) && refresh_pending
+        (($(date +%s) - last_check >= CHECK_INTERVAL)) && refresh_fast
+        (($(date +%s) - last_docker_check >= DOCKER_CHECK_INTERVAL)) && refresh_docker
     fi
 
     if [[ -n $UPDATE_TIME ]]; then
@@ -182,7 +329,7 @@ while true; do
         fi
         if (($(date +%s) >= target)); then
             target=0
-            do_run
+            do_run run_updates
             continue
         fi
     else

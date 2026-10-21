@@ -19,7 +19,9 @@ AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
 DB_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "."), "state.db")
 MAX_BODY = 1 << 20
 HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-PKG_RE = re.compile(r"^[A-Za-z0-9@._+-]{1,128}$")
+PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}$")
+IMG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,254}$")
+KINDS = ("pacman", "aur", "docker")
 
 
 @contextmanager
@@ -39,25 +41,38 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS hosts(
                 name TEXT PRIMARY KEY, last_seen REAL, status TEXT, pending TEXT,
-                run_requested INTEGER NOT NULL DEFAULT 0,
+                run_requested INTEGER NOT NULL DEFAULT 0, run_items TEXT,
                 last_run REAL, last_result TEXT, last_log TEXT);
             CREATE TABLE IF NOT EXISTS holds(
                 host TEXT NOT NULL, pkg TEXT NOT NULL, PRIMARY KEY(host, pkg));
             """
         )
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(hosts)")]
+        if "run_items" not in cols:   # database from version 0.2.0
+            c.execute("ALTER TABLE hosts ADD COLUMN run_items TEXT")
+
+
+def parse_pending(text):
+    out = []
+    for line in (text or "").splitlines():
+        p = line.split("\t", 2)
+        if len(p) >= 2 and p[0] in KINDS:
+            out.append({"kind": p[0], "name": p[1], "detail": p[2] if len(p) > 2 else ""})
+    return out
 
 
 def state():
     now = time.time()
     with conn() as c:
         hosts = [dict(r) for r in c.execute(
-            "SELECT name,last_seen,status,pending,run_requested,last_run,last_result,"
+            "SELECT name,last_seen,status,pending,run_requested,run_items,last_run,last_result,"
             "last_log IS NOT NULL AND last_log != '' AS has_log FROM hosts ORDER BY name")]
         holds = {}
         for r in c.execute("SELECT host,pkg FROM holds ORDER BY pkg"):
             holds.setdefault(r["host"], []).append(r["pkg"])
     for h in hosts:
-        h["pending"] = [l for l in (h["pending"] or "").splitlines() if l.strip()]
+        h["pending"] = parse_pending(h["pending"])
+        h["queued"] = len((h.pop("run_items") or "").splitlines())   # 0 = full run
         h["holds"] = holds.get(h["name"], [])
     return {"now": now, "global": holds.get("", []), "hosts": hosts}
 
@@ -69,18 +84,32 @@ def agent_poll(host, status, pending):
             "ON CONFLICT(name) DO UPDATE SET last_seen=excluded.last_seen,"
             "status=excluded.status,pending=excluded.pending",
             (host, time.time(), status, pending[:262144]))
-        run = c.execute("SELECT run_requested FROM hosts WHERE name=?", (host,)).fetchone()[0]
+        row = c.execute("SELECT run_requested,run_items FROM hosts WHERE name=?", (host,)).fetchone()
+        run = bool(row["run_requested"]) and status != "running"   # nothing is handed out mid-run
         if run:
-            c.execute("UPDATE hosts SET run_requested=0 WHERE name=?", (host,))
+            c.execute("UPDATE hosts SET run_requested=0, run_items=NULL WHERE name=?", (host,))
         pkgs = [r[0] for r in c.execute(
             "SELECT DISTINCT pkg FROM holds WHERE host IN ('', ?) ORDER BY pkg", (host,))]
-    return "".join("hold %s\n" % p for p in pkgs) + ("run\n" if run else "")
+    out = "".join("hold %s\n" % p for p in pkgs)
+    if run:
+        items = (row["run_items"] or "").splitlines()
+        out += ("runsel\n" + "".join("item %s\n" % i for i in items)) if items else "run\n"
+    return out
 
 
 def agent_log(host, result, text):
     with conn() as c:
         c.execute("UPDATE hosts SET last_run=?, last_result=?, last_log=? WHERE name=?",
                   (time.time(), result, text, host))
+
+
+def valid_item(it):
+    if not isinstance(it, dict):
+        return False
+    kind, name = it.get("kind"), it.get("name")
+    if not isinstance(name, str):
+        return False
+    return bool((kind in ("pacman", "aur") and PKG_RE.match(name)) or (kind == "docker" and IMG_RE.match(name)))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -184,8 +213,14 @@ class Handler(BaseHTTPRequestHandler):
                         c.execute("DELETE FROM holds WHERE host=? AND pkg=?", (host, pkg))
                     print("hold %s %s for %s" % (pkg, "on" if on else "off", host or "all hosts"), flush=True)
                 elif u.path == "/api/run":
-                    c.execute("UPDATE hosts SET run_requested=1 WHERE name=? AND status != 'running'", (host,))
-                    print("manual update requested for %s" % host, flush=True)
+                    items = req.get("items") or []
+                    if not isinstance(items, list) or len(items) > 500 or not all(valid_item(i) for i in items):
+                        return self.send(400, "bad items\n")
+                    text = "\n".join("%s %s" % (i["kind"], i["name"]) for i in items)
+                    c.execute("UPDATE hosts SET run_requested=1, run_items=? WHERE name=? AND status != 'running'",
+                              (text or None, host))
+                    print("update requested for %s (%s)" % (host, "%d selected items" % len(items) if items else "all"),
+                          flush=True)
                 else:
                     c.execute("DELETE FROM hosts WHERE name=?", (host,))
                     c.execute("DELETE FROM holds WHERE host=?", (host,))
@@ -215,6 +250,7 @@ h2{font-size:16px;margin:0}
 .badge{font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid currentColor}
 .badge.online{color:var(--ok)}.badge.offline{color:var(--bad)}.badge.running{color:var(--warn)}
 button,input{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 10px}
+input[type=checkbox]{padding:0;width:auto;margin:0}
 button{cursor:pointer}button:disabled{opacity:.5;cursor:default}
 button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
 .holds{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
@@ -222,19 +258,25 @@ button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
 .chip button{border:0;background:none;padding:0 6px;color:var(--mut)}
 .add{display:flex;gap:6px}
 details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
-.pend{font-family:monospace;font-size:13px;margin-top:6px;max-height:260px;overflow:auto}
-.held{text-decoration:line-through;color:var(--mut)}
+.pend{margin-top:6px;max-height:420px;overflow:auto}
+.grp{display:flex;gap:8px;align-items:center;margin:10px 0 4px;font-weight:600}
+.row{display:flex;gap:8px;align-items:baseline;padding:1px 0;font-family:monospace;font-size:13px;cursor:pointer}
+.row .d{color:var(--mut)}
+.row.held .nm{text-decoration:line-through;color:var(--mut)}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;max-height:360px;overflow:auto;font-size:12px;white-space:pre-wrap}
 #err{color:var(--bad)}
 </style></head><body><main>
 <h1>next-update</h1><p id="err" hidden>Server not reachable.</p><div id="app"></div></main>
 <script>
 const $=s=>document.querySelector(s);
-const opened=new Set();
+const opened=new Map();
+const sel=new Map();
+let last=null;
 const el=(t,a,...k)=>{const e=document.createElement(t);for(const[n,v]of Object.entries(a||{})){if(n==='class')e.className=v;else if(n==='disabled'){if(v)e.disabled=true}else if(n.startsWith('on'))e.addEventListener(n.slice(2),v);else e.setAttribute(n,v)}e.append(...k.filter(x=>x!=null&&x!==false));return e};
 const api=async(p,b)=>{const r=await fetch(p,b?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{});if(!r.ok)throw new Error(r.status);return r};
 const ago=s=>{s=Math.max(0,Math.round(s));if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago'};
 const act=async(p,b)=>{try{await api(p,b)}catch(e){alert('Request failed: '+e.message)}if(document.activeElement)document.activeElement.blur();load()};
+const KINDS={pacman:'Pacman',aur:'AUR (yay)',docker:'Docker images'};
 
 function holds(host,list){
   const inp=el('input',{placeholder:'package name',maxlength:'128',autocomplete:'off'});
@@ -243,35 +285,66 @@ function holds(host,list){
     ...list.map(p=>el('span',{class:'chip'},p,el('button',{title:'release',onclick:()=>act('/api/hold',{host,pkg:p,on:false})},'×'))),
     form);
 }
-function det(key,sum,body,ontoggle){
+function det(key,dflt,sum,body,ontoggle){
   const d=el('details',{},el('summary',{},sum),body);
-  if(opened.has(key))d.open=true;
-  d.addEventListener('toggle',()=>{d.open?opened.add(key):opened.delete(key);if(ontoggle)ontoggle(d)});
+  d.open=opened.has(key)?opened.get(key):dflt;
+  d.addEventListener('toggle',()=>{opened.set(key,d.open);if(ontoggle)ontoggle(d)});
   return d;
+}
+function pendingBlock(h,held,set){
+  const wrap=el('div',{class:'pend'});
+  for(const kind of Object.keys(KINDS)){
+    const items=h.pending.filter(p=>p.kind===kind);
+    if(!items.length)continue;
+    const keys=items.map(p=>kind+'\t'+p.name);
+    const master=el('input',{type:'checkbox',title:'select all',onchange:e=>{keys.forEach(k=>e.target.checked?set.add(k):set.delete(k));render(last)}});
+    master.checked=keys.every(k=>set.has(k));
+    wrap.append(el('div',{class:'grp'},master,KINDS[kind]+' ('+items.length+')'));
+    for(const p of items){
+      const k=kind+'\t'+p.name;
+      const cb=el('input',{type:'checkbox',onchange:e=>{e.target.checked?set.add(k):set.delete(k);render(last)}});
+      cb.checked=set.has(k);
+      wrap.append(el('label',{class:'row'+(held.has(p.name)?' held':'')},cb,el('span',{class:'nm'},p.name),el('span',{class:'d'},p.detail)));
+    }
+  }
+  return wrap;
 }
 function hostCard(h,s){
   const age=s.now-h.last_seen;
   const state=(h.status==='running'&&age<3600)?'running':age<60?'online':'offline';
-  const all=new Set([...s.global,...h.holds]);
-  const pend=el('div',{class:'pend'},...h.pending.map(l=>el('div',{class:all.has(l.split(' ')[0])?'held':''},l)));
+  const held=new Set([...s.global,...h.holds]);
+  const set=sel.get(h.name)||new Set();sel.set(h.name,set);
+  const keys=new Set(h.pending.map(p=>p.kind+'\t'+p.name));
+  for(const k of [...set])if(!keys.has(k))set.delete(k);
+  const counts=Object.keys(KINDS).map(k=>[k,h.pending.filter(p=>p.kind===k).length]).filter(x=>x[1]).map(x=>x[1]+' '+x[0]).join(', ');
+  const busy=state==='running'||h.run_requested;
+  const runSel=()=>{
+    const items=[...set].map(k=>{const[kind,name]=k.split('\t');return{kind,name}});
+    const pm=items.filter(i=>i.kind==='pacman').length,all=h.pending.filter(p=>p.kind==='pacman').length;
+    if(pm&&pm<all&&!confirm('Updating only some pacman packages is a partial upgrade. Arch does not support that and it can break the system. Continue?'))return;
+    set.clear();act('/api/run',{host:h.name,items});
+  };
+  const pend=h.pending.length?det('p:'+h.name,true,h.pending.length+' pending: '+counts,pendingBlock(h,held,set)):el('div',{class:'lbl'},'Up to date');
   const pre=el('pre',{},'loading...');
   const loadLog=()=>fetch('/api/log?host='+encodeURIComponent(h.name)).then(r=>r.text()).then(t=>{pre.textContent=t||'(empty)'}).catch(()=>{pre.textContent='failed to load'});
   const logSum='Last run: '+(h.last_result?h.last_result+', '+ago(s.now-h.last_run):'never');
   return el('section',{class:'card'},
     el('div',{class:'head'},el('h2',{},h.name),el('span',{class:'badge '+state},state),el('span',{class:'mut'},'seen '+ago(age)),el('span',{class:'sp'}),
-      el('button',{class:'pri',disabled:state==='running'||h.run_requested,onclick:()=>act('/api/run',{host:h.name})},h.run_requested?'Queued...':'Update now'),
+      el('button',{disabled:busy||!set.size,onclick:runSel},h.run_requested&&h.queued?'Queued...':'Update selected ('+set.size+')'),
+      el('button',{class:'pri',title:"Runs the COMMANDS from the agent's config",disabled:busy,onclick:()=>act('/api/run',{host:h.name})},h.run_requested&&!h.queued?'Queued...':'Update all'),
       state==='offline'?el('button',{onclick:()=>{if(confirm('Remove '+h.name+'?'))act('/api/delete',{host:h.name})}},'Remove'):null),
-    det('p:'+h.name,h.pending.length+' pending update'+(h.pending.length===1?'':'s'),pend),
+    pend,
     el('div',{class:'lbl'},'Held on this server'),holds(h.name,h.holds),
-    h.has_log?det('l:'+h.name,logSum,pre,d=>{if(d.open)loadLog()}):el('div',{class:'lbl'},logSum));
+    h.has_log?det('l:'+h.name,false,logSum,pre,d=>{if(d.open)loadLog()}):el('div',{class:'lbl'},logSum));
 }
 function render(s){
+  last=s;
   $('#app').replaceChildren(
     el('section',{class:'card'},el('h2',{},'Held on all servers'),el('div',{class:'lbl'},'Skipped by pacman (--ignore) on every server.'),holds('',s.global)),
     ...(s.hosts.length?s.hosts.map(h=>hostCard(h,s)):[el('p',{class:'mut'},'No agents yet. Set SERVER_URL and SERVER_TOKEN in /etc/next-update/config and restart next-update.')]));
 }
 async function load(){
-  const a=document.activeElement;if(a&&a.tagName==='INPUT')return;
+  const a=document.activeElement;if(a&&a.tagName==='INPUT'&&a.type==='text')return;
   try{render(await(await api('/api/state')).json());$('#err').hidden=true}catch(e){$('#err').hidden=false}
 }
 setInterval(load,5000);load();
