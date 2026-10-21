@@ -27,10 +27,20 @@ load_config() {
     AUR_USER=""
     DOCKER_CHECK=yes
     DOCKER_CHECK_INTERVAL=21600
+    DEBIAN_MODE=no
     [[ -r $CONFIG ]] || { err "config not readable: $CONFIG"; return 1; }
     # shellcheck source=/dev/null
     source "$CONFIG" || { err "config has errors: $CONFIG"; return 1; }
-    ((${#COMMANDS[@]})) || { err "COMMANDS is empty in $CONFIG"; return 1; }
+    [[ $DEBIAN_MODE == yes ]] || DEBIAN_MODE=no
+    if ((${#COMMANDS[@]} == 0)); then   # built-in defaults
+        if [[ $DEBIAN_MODE == yes ]]; then
+            COMMANDS=('apt-get update'
+                'apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade')
+        else
+            COMMANDS=('pacman -Syu --noconfirm ${NU_IGNORE:+--ignore "$NU_IGNORE"}')
+        fi
+    fi
+    [[ $DEBIAN_MODE == yes ]] && export DEBIAN_FRONTEND=noninteractive
     [[ $POLL_INTERVAL =~ ^[0-9]+$ ]] && ((POLL_INTERVAL >= 2)) || POLL_INTERVAL=10
     [[ $CHECK_INTERVAL =~ ^[0-9]+$ ]] && ((CHECK_INTERVAL >= 60)) || CHECK_INTERVAL=900
     [[ $DOCKER_CHECK_INTERVAL =~ ^[0-9]+$ ]] && ((DOCKER_CHECK_INTERVAL >= 600)) || DOCKER_CHECK_INTERVAL=21600
@@ -39,9 +49,33 @@ load_config() {
 
 # ---------------------------------------------------------------- full run (COMMANDS from config)
 
+# apt has no --ignore: held packages are put on "apt-mark hold" for the duration of a full run
+APT_HELD_BY_US=()
+apt_hold_start() {
+    local p already
+    local -a names=()
+    APT_HELD_BY_US=()
+    [[ -n ${NU_IGNORE:-} ]] || return 0
+    IFS=, read -ra names <<<"$NU_IGNORE"
+    already=$(apt-mark showhold 2>/dev/null)
+    for p in "${names[@]}"; do
+        grep -qxF "$p" <<<"$already" && continue
+        dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || continue
+        apt-mark hold "$p" >/dev/null 2>&1 && APT_HELD_BY_US+=("$p")
+    done
+    ((${#APT_HELD_BY_US[@]})) && log "apt: holding ${APT_HELD_BY_US[*]} during this run"
+    return 0
+}
+apt_hold_end() {
+    ((${#APT_HELD_BY_US[@]})) && apt-mark unhold "${APT_HELD_BY_US[@]}" >/dev/null 2>&1
+    APT_HELD_BY_US=()
+    return 0
+}
+
 run_updates() {
     local c rc failed=0
     log "update run started"
+    [[ $DEBIAN_MODE == yes ]] && apt_hold_start
     for c in "${COMMANDS[@]}"; do
         log "running: $c"
         bash -c "$c" </dev/null
@@ -54,6 +88,7 @@ run_updates() {
             log "ok: $c"
         fi
     done
+    [[ $DEBIAN_MODE == yes ]] && apt_hold_end
     if ((failed)); then err "update run finished with errors"; else log "update run finished"; fi
     return $failed
 }
@@ -81,14 +116,15 @@ next_epoch() {
 }
 
 # ---------------------------------------------------------------- pending updates
-# Files hold lines "kind<TAB>name<TAB>detail", kind = pacman | aur | docker
+# Files hold lines "kind<TAB>name<TAB>detail", kind = pacman | apt | aur | docker
 
 PEND_DIR=$(mktemp -d)
 PEND_PACMAN=$PEND_DIR/pacman
 PEND_AUR=$PEND_DIR/aur
+PEND_APT=$PEND_DIR/apt
 PEND_DOCKER=$PEND_DIR/docker
 LOG_FILE=$PEND_DIR/log
-: >"$PEND_PACMAN"; : >"$PEND_AUR"; : >"$PEND_DOCKER"
+: >"$PEND_PACMAN"; : >"$PEND_AUR"; : >"$PEND_APT"; : >"$PEND_DOCKER"
 trap 'rm -rf "$PEND_DIR"' EXIT
 
 STATUS=idle
@@ -129,6 +165,22 @@ refresh_aur() {
     rm -f "$tmp"
 }
 
+# Debian: refresh the package lists, then simulate "apt-get upgrade" (what the default command does)
+refresh_apt() {
+    local tmp rc
+    command -v apt-get >/dev/null || { : >"$PEND_APT"; return; }
+    apt-get -qq update >/dev/null 2>&1   # on failure (lock, offline) the old lists are used
+    tmp=$(mktemp -p "$PEND_DIR")
+    apt-get -s upgrade 2>/dev/null | awk '$1 == "Inst" {
+        old = ""; new = $3
+        if ($3 ~ /^\[/) { old = $3; new = $4; gsub(/[\[\]]/, "", old) }
+        gsub(/^\(/, "", new)
+        printf "apt\t%s\t%s -> %s\n", $2, old, new }' >"$tmp"
+    rc=${PIPESTATUS[0]}
+    ((rc == 0)) && mv "$tmp" "$PEND_APT"
+    rm -f "$tmp"
+}
+
 # names of containers (all states) created from exactly this image reference
 docker_containers_of() {
     docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | awk -v i="$1" '$2 == i {print $1}'
@@ -155,12 +207,21 @@ refresh_docker() {
     mv "$tmp" "$PEND_DOCKER"
 }
 
-refresh_fast() { refresh_pacman; refresh_aur; last_check=$(date +%s); }
+refresh_fast() {
+    if [[ $DEBIAN_MODE == yes ]]; then
+        : >"$PEND_PACMAN"; : >"$PEND_AUR"
+        refresh_apt
+    else
+        : >"$PEND_APT"
+        refresh_pacman; refresh_aur
+    fi
+    last_check=$(date +%s)
+}
 refresh_all() { refresh_fast; refresh_docker; }
 
 in_pending() {   # $1 kind, $2 name
     awk -F'\t' -v k="$1" -v n="$2" '$1 == k && $2 == n {f = 1} END {exit !f}' \
-        "$PEND_PACMAN" "$PEND_AUR" "$PEND_DOCKER"
+        "$PEND_PACMAN" "$PEND_APT" "$PEND_AUR" "$PEND_DOCKER"
 }
 
 # ---------------------------------------------------------------- selected updates
@@ -195,7 +256,7 @@ update_docker() {
 # update only the items in SEL ("kind name"), each must be in our own pending list
 run_selected() {
     local it kind name failed=0
-    local -a pm=() ar=() dk=()
+    local -a pm=() ap=() ar=() dk=()
     for it in "${SEL[@]}"; do
         kind=${it%% *}
         name=${it#* }
@@ -205,6 +266,7 @@ run_selected() {
         fi
         case $kind in
             pacman) pm+=("$name") ;;
+            apt) ap+=("$name") ;;
             aur) ar+=("$name") ;;
             docker) dk+=("$name") ;;
         esac
@@ -213,6 +275,11 @@ run_selected() {
     if ((${#pm[@]})); then
         log "pacman: ${pm[*]}"
         pacman -Sy --noconfirm -- "${pm[@]}" </dev/null || { err "pacman failed"; failed=1; }
+    fi
+    if ((${#ap[@]})); then
+        log "apt: ${ap[*]}"
+        apt-get install -y --only-upgrade -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+            "${ap[@]}" </dev/null || { err "apt failed"; failed=1; }
     fi
     if ((${#ar[@]})); then
         log "aur: ${ar[*]}"
@@ -233,7 +300,7 @@ poll_server() {
     local resp k v w
     SRV_RUN=0
     SRV_ITEMS=()
-    resp=$(cat "$PEND_PACMAN" "$PEND_AUR" "$PEND_DOCKER" | curl -fsS --max-time 10 -X POST \
+    resp=$(cat "$PEND_PACMAN" "$PEND_APT" "$PEND_AUR" "$PEND_DOCKER" | curl -fsS --max-time 10 -X POST \
         -H "Authorization: Bearer $TOKEN" -H "X-Status: $STATUS" \
         --data-binary @- "$WEB_URL/api/poll?host=$HOST_NAME" 2>&1) || {
         if ((SRV_OK)); then err "web ui: ${resp:-request failed}"; SRV_OK=0; fi
@@ -243,11 +310,11 @@ poll_server() {
     SRV_HOLD=()
     while read -r k v w; do
         case $k in
-            hold) [[ $v =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]] && SRV_HOLD+=("$v") ;;
+            hold) [[ $v =~ ^[A-Za-z0-9][A-Za-z0-9@._+:-]*$ ]] && SRV_HOLD+=("$v") ;;
             run) SRV_RUN=1 ;;
             runsel) SRV_RUN=2 ;;
             item)
-                if [[ $v =~ ^(pacman|aur)$ && $w =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]] \
+                if [[ $v =~ ^(pacman|apt|aur)$ && $w =~ ^[A-Za-z0-9][A-Za-z0-9@._+:-]*$ ]] \
                     || [[ $v == docker && $w =~ ^[A-Za-z0-9][A-Za-z0-9._/:-]*$ ]]; then
                     SRV_ITEMS+=("$v $w")
                 fi ;;

@@ -20,9 +20,9 @@ TOKEN = os.environ.get("TOKEN", "")
 DB_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "."), "state.db")
 MAX_BODY = 1 << 20
 HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}$")
+PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+:-]{0,127}$")
 IMG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,254}$")
-KINDS = ("pacman", "aur", "docker")
+KINDS = ("pacman", "apt", "aur", "docker")
 
 
 @contextmanager
@@ -110,7 +110,7 @@ def valid_item(it):
     kind, name = it.get("kind"), it.get("name")
     if not isinstance(name, str):
         return False
-    return bool((kind in ("pacman", "aur") and PKG_RE.match(name)) or (kind == "docker" and IMG_RE.match(name)))
+    return bool((kind in ("pacman", "apt", "aur") and PKG_RE.match(name)) or (kind == "docker" and IMG_RE.match(name)))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -280,7 +280,7 @@ const el=(t,a,...k)=>{const e=document.createElement(t);for(const[n,v]of Object.
 const api=async(p,b)=>{const r=await fetch(p,b?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{});if(!r.ok)throw new Error(r.status);return r};
 const ago=s=>{s=Math.max(0,Math.round(s));if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago'};
 const act=async(p,b)=>{try{await api(p,b)}catch(e){alert('Request failed: '+e.message)}if(document.activeElement)document.activeElement.blur();load()};
-const KINDS={pacman:'Pacman',aur:'AUR (yay)',docker:'Docker images'};
+const KINDS={pacman:'Pacman',apt:'APT',aur:'AUR (yay)',docker:'Docker images'};
 
 function holds(host,list){
   const inp=el('input',{placeholder:'package name',maxlength:'128',autocomplete:'off'});
@@ -344,7 +344,7 @@ function hostCard(h,s){
 function render(s){
   last=s;
   $('#app').replaceChildren(
-    el('section',{class:'card'},el('h2',{},'Held on all servers'),el('div',{class:'lbl'},'Skipped by pacman (--ignore) on every server.'),holds('',s.global)),
+    el('section',{class:'card'},el('h2',{},'Held on all servers'),el('div',{class:'lbl'},'Skipped on every server (pacman --ignore, apt hold during the run).'),holds('',s.global)),
     ...(s.hosts.length?s.hosts.map(h=>hostCard(h,s)):[el('p',{class:'mut'},'No servers yet. Set WEB_URL and TOKEN in /etc/next-update-server/config and restart next-update-server.')]));
 }
 async function load(){

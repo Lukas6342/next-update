@@ -1,5 +1,6 @@
 # next-update
-Auto update for Arch-based GNU/Linux servers (systemd, pacman packages) with an optional central web UI.
+Auto update for GNU/Linux servers (systemd) with an optional central web UI.
+Arch (pacman, AUR) and Debian (apt) are supported, plus Docker images on both.
 
 Two separate packages:
 
@@ -35,12 +36,13 @@ sudo systemctl enable --now next-update-server
 
 | Option | Meaning |
 |---|---|
+| `DEBIAN_MODE` | `yes`/`no` - use apt instead of pacman/AUR, see below |
 | `RUN_ON_BOOT` | `yes`/`no` - run updates whenever the daemon starts |
 | `UPDATE_TIME` | `HH:MM` daily run time, empty = no schedule |
 | `UPDATE_DAYS` | `all` or e.g. `mon,thu` |
 | `STOP_ON_ERROR` | `yes`/`no` - stop at first failing command |
 | `HOLD_PKGS` | bash array of packages that are never updated on this server |
-| `COMMANDS` | bash array of commands, run in order |
+| `COMMANDS` | bash array of commands, run in order. Optional, the default depends on `DEBIAN_MODE` |
 | `WEB_URL`, `TOKEN` | link to next-update-web (optional) |
 | `HOST_NAME` | name in the UI, default: hostname |
 | `POLL_INTERVAL` | seconds between polls of the web UI, default 10 |
@@ -51,17 +53,27 @@ sudo systemctl enable --now next-update-server
 Schedule/command changes are picked up after the next run; restart the service to apply them immediately
 (with `RUN_ON_BOOT=yes` this triggers an update run).
 
+### Debian mode
+`DEBIAN_MODE=yes` switches the daemon to apt:
+- Pending updates come from `apt-get update` + a simulated `apt-get upgrade` (shown as **APT** in the UI).
+  They are checked every `CHECK_INTERVAL`, so every check refreshes the package lists.
+- Default `COMMANDS`: `apt-get update`, then a non-interactive `apt-get -y upgrade` that keeps your modified config files.
+- "Update selected" runs `apt-get install -y --only-upgrade <packages>`.
+- Held packages are put on `apt-mark hold` for the duration of a full run and released afterwards.
+  If the daemon is killed in the middle of a run, they stay held; check `apt-mark showhold`.
+- pacman and AUR are not used. Docker works as in Arch mode (needs the `docker buildx` and `docker compose` plugins).
+
 ### Holding packages
 Held packages (local `HOLD_PKGS` + holds set in the web UI, globally or per server) are passed to your commands
-as the environment variable `NU_IGNORE` (comma separated). The default command uses it:
+as the environment variable `NU_IGNORE` (comma separated). The default pacman command uses it:
 ```
 pacman -Syu --noconfirm ${NU_IGNORE:+--ignore "$NU_IGNORE"}
 ```
-If you change `COMMANDS`, keep that part, otherwise holds are not applied.
+If you set your own `COMMANDS` on Arch, keep that part, otherwise holds are not applied.
 
 ## Web UI
 - Status of every server (online / offline / running), last seen
-- Pending updates per server, grouped: **Pacman**, **AUR (yay)**, **Docker images** (held packages are struck through)
+- Pending updates per server, grouped: **Pacman** or **APT**, **AUR (yay)**, **Docker images** (held packages are struck through)
 - Tick single entries and press **Update selected**, or press **Update all** (runs the `COMMANDS` from the server's config)
 - Hold packages per server or on all servers
 - A request starts within `POLL_INTERVAL` seconds
@@ -71,6 +83,7 @@ If you change `COMMANDS`, keep that part, otherwise holds are not applied.
 | Kind | Command run by the daemon |
 |---|---|
 | Pacman | `pacman -Sy --noconfirm -- <packages>` |
+| APT | `apt-get install -y --only-upgrade <packages>` |
 | AUR | `yay -S --noconfirm -- <packages>` as `AUR_USER` |
 | Docker | `docker pull <image>`, then `docker compose up -d --no-deps <service>` for every compose-managed container using the image. Containers not created by compose are only pulled, recreate them yourself. |
 
