@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# next-update - auto update daemon for servers (systemd)
+# Logs go to stdout/stderr -> journalctl -u next-update
+
+set -u
+export LC_ALL=C
+CONFIG="${NEXT_UPDATE_CONFIG:-/etc/next-update/config}"
+
+log() { echo "$*"; }
+err() { echo "<3>$*"; }   # journald priority "err"
+
+load_config() {
+    RUN_ON_BOOT=yes
+    UPDATE_TIME=""
+    UPDATE_DAYS="all"
+    STOP_ON_ERROR=no
+    COMMANDS=()
+    [[ -r $CONFIG ]] || { err "config not readable: $CONFIG"; return 1; }
+    # shellcheck source=/dev/null
+    source "$CONFIG" || { err "config has errors: $CONFIG"; return 1; }
+    ((${#COMMANDS[@]})) || { err "COMMANDS is empty in $CONFIG"; return 1; }
+}
+
+run_updates() {
+    local c rc failed=0
+    log "update run started"
+    for c in "${COMMANDS[@]}"; do
+        log "running: $c"
+        bash -c "$c" </dev/null
+        rc=$?
+        if ((rc)); then
+            err "failed (exit $rc): $c"
+            failed=1
+            [[ $STOP_ON_ERROR == yes ]] && break
+        else
+            log "ok: $c"
+        fi
+    done
+    if ((failed)); then err "update run finished with errors"; else log "update run finished"; fi
+}
+
+# epoch of the next matching day/time in the future
+next_epoch() {
+    local d t now day days
+    now=$(date +%s)
+    days=",${UPDATE_DAYS// /},"
+    days=${days,,}
+    for d in 0 1 2 3 4 5 6 7; do
+        # build "YYYY-MM-DD HH:MM" explicitly (a bare "+N day" after a time is parsed as a timezone)
+        t=$(date -d "$(date -d "$d days" +%F) $UPDATE_TIME" +%s 2>/dev/null) || return 1
+        ((t > now)) || continue
+        day=$(date -d "@$t" +%a)
+        day=${day,,}
+        if [[ $days == ",all," || $days == *",$day,"* ]]; then
+            echo "$t"
+            return 0
+        fi
+    done
+    return 1
+}
+
+load_config || exit 1
+
+if [[ $RUN_ON_BOOT == yes ]]; then
+    run_updates
+fi
+
+while true; do
+    load_config || { sleep 60; continue; }
+
+    if [[ -z $UPDATE_TIME ]]; then
+        sleep 3600   # no schedule set; re-check config hourly
+        continue
+    fi
+
+    target=$(next_epoch) || { err "invalid UPDATE_TIME/UPDATE_DAYS in $CONFIG"; sleep 60; continue; }
+    log "next run: $(date -d "@$target" '+%a %F %T')"
+
+    while ((($(date +%s)) < target)); do
+        left=$((target - $(date +%s)))
+        sleep $((left > 3600 ? 3600 : left))
+    done
+
+    run_updates
+done

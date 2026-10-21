@@ -1,0 +1,27 @@
+# /etc/next-update/config  (sourced as bash, keep it root-only: chmod 600)
+
+# Run updates every time the daemon starts (i.e. on boot): yes / no
+RUN_ON_BOOT=yes
+
+# Scheduled run: time of day (HH:MM, 24h, server local time). Empty = no schedule.
+UPDATE_TIME="04:00"
+
+# Days of the schedule: all, or comma separated: mon,tue,wed,thu,fri,sat,sun
+UPDATE_DAYS="all"
+
+# Abort the run at the first failing command: yes / no
+STOP_ON_ERROR=no
+
+# Commands, executed in order, each via `bash -c`.
+export DEBIAN_FRONTEND=noninteractive
+COMMANDS=(
+    "apt-get update"
+    "apt-get -y upgrade"
+    "apt-get -y autoremove"
+)
+
+# Other examples:
+# COMMANDS=("dnf -y upgrade")
+# COMMANDS=("pacman -Syu --noconfirm")
+# COMMANDS=("zypper -n dup")
+# Reboot after updating: add "systemctl reboot" as last command.

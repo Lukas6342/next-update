@@ -1,0 +1,17 @@
+[Unit]
+Description=next-update auto update daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/next-update
+Restart=on-failure
+RestartSec=60
+SyslogIdentifier=next-update
+# on stop only signal the daemon itself; a running package manager is not killed mid-upgrade
+KillMode=mixed
+TimeoutStopSec=600
+
+[Install]
+WantedBy=multi-user.target
