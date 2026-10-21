@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""next-update-server - central web UI for next-update agents (stdlib only)."""
+import base64
+import hmac
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+LISTEN = os.environ.get("LISTEN", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8080"))
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
+DB_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "."), "state.db")
+MAX_BODY = 1 << 20
+HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+PKG_RE = re.compile(r"^[A-Za-z0-9@._+-]{1,128}$")
+
+
+@contextmanager
+def conn():
+    c = sqlite3.connect(DB_FILE, timeout=10)
+    c.row_factory = sqlite3.Row
+    try:
+        with c:
+            yield c
+    finally:
+        c.close()
+
+
+def init_db():
+    with conn() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS hosts(
+                name TEXT PRIMARY KEY, last_seen REAL, status TEXT, pending TEXT,
+                run_requested INTEGER NOT NULL DEFAULT 0,
+                last_run REAL, last_result TEXT, last_log TEXT);
+            CREATE TABLE IF NOT EXISTS holds(
+                host TEXT NOT NULL, pkg TEXT NOT NULL, PRIMARY KEY(host, pkg));
+            """
+        )
+
+
+def state():
+    now = time.time()
+    with conn() as c:
+        hosts = [dict(r) for r in c.execute(
+            "SELECT name,last_seen,status,pending,run_requested,last_run,last_result,"
+            "last_log IS NOT NULL AND last_log != '' AS has_log FROM hosts ORDER BY name")]
+        holds = {}
+        for r in c.execute("SELECT host,pkg FROM holds ORDER BY pkg"):
+            holds.setdefault(r["host"], []).append(r["pkg"])
+    for h in hosts:
+        h["pending"] = [l for l in (h["pending"] or "").splitlines() if l.strip()]
+        h["holds"] = holds.get(h["name"], [])
+    return {"now": now, "global": holds.get("", []), "hosts": hosts}
+
+
+def agent_poll(host, status, pending):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO hosts(name,last_seen,status,pending) VALUES(?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET last_seen=excluded.last_seen,"
+            "status=excluded.status,pending=excluded.pending",
+            (host, time.time(), status, pending[:262144]))
+        run = c.execute("SELECT run_requested FROM hosts WHERE name=?", (host,)).fetchone()[0]
+        if run:
+            c.execute("UPDATE hosts SET run_requested=0 WHERE name=?", (host,))
+        pkgs = [r[0] for r in c.execute(
+            "SELECT DISTINCT pkg FROM holds WHERE host IN ('', ?) ORDER BY pkg", (host,))]
+    return "".join("hold %s\n" % p for p in pkgs) + ("run\n" if run else "")
+
+
+def agent_log(host, result, text):
+    with conn() as c:
+        c.execute("UPDATE hosts SET last_run=?, last_result=?, last_log=? WHERE name=?",
+                  (time.time(), result, text, host))
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "next-update"
+
+    def log_message(self, *args):
+        pass
+
+    def send(self, code, body, ctype="text/plain; charset=utf-8", headers=None):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n < 0 or n > MAX_BODY:
+            raise ValueError("body too large")
+        return self.rfile.read(n)
+
+    def admin(self):
+        h = self.headers.get("Authorization", "")
+        if h.startswith("Basic "):
+            try:
+                given = base64.b64decode(h[6:]).decode()
+            except Exception:
+                given = ""
+            if hmac.compare_digest(given.partition(":")[2].encode(), ADMIN_PASSWORD.encode()):
+                return True
+        self.send(401, "login required\n", headers={"WWW-Authenticate": 'Basic realm="next-update"'})
+        return False
+
+    def agent(self):
+        h = self.headers.get("Authorization", "")
+        if h.startswith("Bearer ") and hmac.compare_digest(h[7:].encode(), AGENT_TOKEN.encode()):
+            return True
+        print("rejected agent request from %s (bad token)" % self.client_address[0], flush=True)
+        self.send(401, "bad token\n")
+        return False
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path not in ("/", "/api/state", "/api/log"):
+            return self.send(404, "not found\n")
+        if not self.admin():
+            return
+        if u.path == "/":
+            return self.send(200, PAGE, "text/html; charset=utf-8", {
+                "Content-Security-Policy":
+                    "default-src 'none'; script-src 'unsafe-inline'; "
+                    "style-src 'unsafe-inline'; connect-src 'self'"})
+        if u.path == "/api/state":
+            return self.send(200, json.dumps(state()), "application/json")
+        host = (parse_qs(u.query).get("host") or [""])[0]
+        with conn() as c:
+            row = c.execute("SELECT last_log FROM hosts WHERE name=?", (host,)).fetchone()
+        self.send(200, (row[0] or "") if row else "")
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        try:
+            if u.path in ("/api/poll", "/api/log"):
+                if not self.agent():
+                    return
+                host = (parse_qs(u.query).get("host") or [""])[0]
+                if not HOST_RE.match(host):
+                    return self.send(400, "bad host\n")
+                data = self.body().decode("utf-8", "replace")
+                if u.path == "/api/poll":
+                    status = "running" if self.headers.get("X-Status") == "running" else "idle"
+                    return self.send(200, agent_poll(host, status, data))
+                result = "ok" if self.headers.get("X-Result") == "ok" else "failed"
+                agent_log(host, result, data[-65536:])
+                return self.send(200, "ok\n")
+
+            if u.path not in ("/api/hold", "/api/run", "/api/delete"):
+                return self.send(404, "not found\n")
+            if not self.admin():
+                return
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return self.send(415, "json required\n")
+            req = json.loads(self.body() or b"{}")
+            host = req.get("host", "")
+            if not isinstance(host, str) or not (host == "" and u.path == "/api/hold" or HOST_RE.match(host)):
+                return self.send(400, "bad host\n")
+            with conn() as c:
+                if u.path == "/api/hold":
+                    pkg = req.get("pkg", "")
+                    if not isinstance(pkg, str) or not PKG_RE.match(pkg):
+                        return self.send(400, "bad package name\n")
+                    on = bool(req.get("on"))
+                    if on:
+                        c.execute("INSERT OR IGNORE INTO holds(host,pkg) VALUES(?,?)", (host, pkg))
+                    else:
+                        c.execute("DELETE FROM holds WHERE host=? AND pkg=?", (host, pkg))
+                    print("hold %s %s for %s" % (pkg, "on" if on else "off", host or "all hosts"), flush=True)
+                elif u.path == "/api/run":
+                    c.execute("UPDATE hosts SET run_requested=1 WHERE name=? AND status != 'running'", (host,))
+                    print("manual update requested for %s" % host, flush=True)
+                else:
+                    c.execute("DELETE FROM hosts WHERE name=?", (host,))
+                    c.execute("DELETE FROM holds WHERE host=?", (host,))
+                    print("removed host %s" % host, flush=True)
+            self.send(200, "ok\n")
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
+            self.send(400, "bad request: %s\n" % e)
+
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>next-update</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1b1f24;--mut:#6a737d;--line:#e1e4e8;--acc:#2563eb;--ok:#16a34a;--bad:#dc2626;--warn:#d97706}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#161b22;--fg:#e6edf3;--mut:#8b949e;--line:#30363d;--acc:#4c8dff;--ok:#3fb950;--bad:#f85149;--warn:#d29922}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
+main{max-width:860px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:8px 0 16px}
+h2{font-size:16px;margin:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+.head{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:8px}
+.sp{flex:1}
+.mut{color:var(--mut);font-size:13px}
+.lbl{color:var(--mut);font-size:13px;margin:10px 0 4px}
+.badge{font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid currentColor}
+.badge.online{color:var(--ok)}.badge.offline{color:var(--bad)}.badge.running{color:var(--warn)}
+button,input{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 10px}
+button{cursor:pointer}button:disabled{opacity:.5;cursor:default}
+button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+.holds{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:99px;padding:1px 4px 1px 10px;font-family:monospace;font-size:13px}
+.chip button{border:0;background:none;padding:0 6px;color:var(--mut)}
+.add{display:flex;gap:6px}
+details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
+.pend{font-family:monospace;font-size:13px;margin-top:6px;max-height:260px;overflow:auto}
+.held{text-decoration:line-through;color:var(--mut)}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;max-height:360px;overflow:auto;font-size:12px;white-space:pre-wrap}
+#err{color:var(--bad)}
+</style></head><body><main>
+<h1>next-update</h1><p id="err" hidden>Server not reachable.</p><div id="app"></div></main>
+<script>
+const $=s=>document.querySelector(s);
+const opened=new Set();
+const el=(t,a,...k)=>{const e=document.createElement(t);for(const[n,v]of Object.entries(a||{})){if(n==='class')e.className=v;else if(n==='disabled'){if(v)e.disabled=true}else if(n.startsWith('on'))e.addEventListener(n.slice(2),v);else e.setAttribute(n,v)}e.append(...k.filter(x=>x!=null&&x!==false));return e};
+const api=async(p,b)=>{const r=await fetch(p,b?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{});if(!r.ok)throw new Error(r.status);return r};
+const ago=s=>{s=Math.max(0,Math.round(s));if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago'};
+const act=async(p,b)=>{try{await api(p,b)}catch(e){alert('Request failed: '+e.message)}if(document.activeElement)document.activeElement.blur();load()};
+
+function holds(host,list){
+  const inp=el('input',{placeholder:'package name',maxlength:'128',autocomplete:'off'});
+  const form=el('form',{class:'add',onsubmit:e=>{e.preventDefault();const p=inp.value.trim();if(p)act('/api/hold',{host,pkg:p,on:true})}},inp,el('button',{type:'submit'},'Hold'));
+  return el('div',{class:'holds'},
+    ...list.map(p=>el('span',{class:'chip'},p,el('button',{title:'release',onclick:()=>act('/api/hold',{host,pkg:p,on:false})},'×'))),
+    form);
+}
+function det(key,sum,body,ontoggle){
+  const d=el('details',{},el('summary',{},sum),body);
+  if(opened.has(key))d.open=true;
+  d.addEventListener('toggle',()=>{d.open?opened.add(key):opened.delete(key);if(ontoggle)ontoggle(d)});
+  return d;
+}
+function hostCard(h,s){
+  const age=s.now-h.last_seen;
+  const state=(h.status==='running'&&age<3600)?'running':age<60?'online':'offline';
+  const all=new Set([...s.global,...h.holds]);
+  const pend=el('div',{class:'pend'},...h.pending.map(l=>el('div',{class:all.has(l.split(' ')[0])?'held':''},l)));
+  const pre=el('pre',{},'loading...');
+  const loadLog=()=>fetch('/api/log?host='+encodeURIComponent(h.name)).then(r=>r.text()).then(t=>{pre.textContent=t||'(empty)'}).catch(()=>{pre.textContent='failed to load'});
+  const logSum='Last run: '+(h.last_result?h.last_result+', '+ago(s.now-h.last_run):'never');
+  return el('section',{class:'card'},
+    el('div',{class:'head'},el('h2',{},h.name),el('span',{class:'badge '+state},state),el('span',{class:'mut'},'seen '+ago(age)),el('span',{class:'sp'}),
+      el('button',{class:'pri',disabled:state==='running'||h.run_requested,onclick:()=>act('/api/run',{host:h.name})},h.run_requested?'Queued...':'Update now'),
+      state==='offline'?el('button',{onclick:()=>{if(confirm('Remove '+h.name+'?'))act('/api/delete',{host:h.name})}},'Remove'):null),
+    det('p:'+h.name,h.pending.length+' pending update'+(h.pending.length===1?'':'s'),pend),
+    el('div',{class:'lbl'},'Held on this server'),holds(h.name,h.holds),
+    h.has_log?det('l:'+h.name,logSum,pre,d=>{if(d.open)loadLog()}):el('div',{class:'lbl'},logSum));
+}
+function render(s){
+  $('#app').replaceChildren(
+    el('section',{class:'card'},el('h2',{},'Held on all servers'),el('div',{class:'lbl'},'Skipped by pacman (--ignore) on every server.'),holds('',s.global)),
+    ...(s.hosts.length?s.hosts.map(h=>hostCard(h,s)):[el('p',{class:'mut'},'No agents yet. Set SERVER_URL and SERVER_TOKEN in /etc/next-update/config and restart next-update.')]));
+}
+async function load(){
+  const a=document.activeElement;if(a&&a.tagName==='INPUT')return;
+  try{render(await(await api('/api/state')).json());$('#err').hidden=true}catch(e){$('#err').hidden=false}
+}
+setInterval(load,5000);load();
+</script></body></html>
+"""
+
+
+def main():
+    if not ADMIN_PASSWORD or not AGENT_TOKEN:
+        sys.exit("ADMIN_PASSWORD and AGENT_TOKEN must be set in /etc/next-update-server/config")
+    init_db()
+    srv = ThreadingHTTPServer((LISTEN, PORT), Handler)
+    print("listening on %s:%d" % (LISTEN, PORT), flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

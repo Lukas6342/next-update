@@ -1,19 +1,39 @@
 # next-update
-An auto update daemon for Arch-based GNU/Linux servers (systemd, pacman package).
+Auto update daemon for Arch-based GNU/Linux servers (systemd, pacman packages), with an optional central web UI.
 
-Runs your update commands on every start (boot) and/or at a fixed time of day / on fixed weekdays.
+Two packages are built from this repo:
+
+| Package | What it is |
+|---|---|
+| `next-update` | Agent, runs on every server. Runs your update commands on boot and/or on a schedule. |
+| `next-update-server` | Central web UI, runs on **one** server. Shows all agents, holds back packages, triggers updates. |
+
+The agent also works standalone, without a server.
 
 ## Install
 ```
 git clone https://github.com/Lukas6342/next-update
 cd next-update
-makepkg -si
+makepkg -si          # installs both; use `makepkg -s` and pacman -U to pick one
+```
+
+### Agent (every server)
+```
 sudo $EDITOR /etc/next-update/config
 sudo systemctl enable --now next-update
 ```
 
-## Config
-`/etc/next-update/config` (bash syntax, kept on package upgrades via pacman's backup mechanism):
+### Web server (one server)
+```
+sudo $EDITOR /etc/next-update-server/config     # set ADMIN_PASSWORD and AGENT_TOKEN
+sudo systemctl enable --now next-update-server
+```
+Open `http://<server>:8080`, log in with any username and `ADMIN_PASSWORD`.
+Link an agent by setting `SERVER_URL` and `SERVER_TOKEN` (= `AGENT_TOKEN`) in its config and restarting it.
+It then shows up in the UI by its hostname.
+
+## Agent config
+`/etc/next-update/config` (bash syntax):
 
 | Option | Meaning |
 |---|---|
@@ -21,11 +41,37 @@ sudo systemctl enable --now next-update
 | `UPDATE_TIME` | `HH:MM` daily run time, empty = no schedule |
 | `UPDATE_DAYS` | `all` or e.g. `mon,thu` |
 | `STOP_ON_ERROR` | `yes`/`no` - stop at first failing command |
+| `HOLD_PKGS` | bash array of packages that are never updated on this server |
 | `COMMANDS` | bash array of commands, run in order |
+| `SERVER_URL`, `SERVER_TOKEN` | link to next-update-server (optional) |
+| `HOST_NAME` | name in the UI, default: hostname |
+| `POLL_INTERVAL` | seconds between server polls, default 10 |
+| `CHECK_INTERVAL` | seconds between pending-update checks, default 900 |
 
-Schedule/command changes are picked up after the next run; restart the service to apply them immediately (with `RUN_ON_BOOT=yes` this triggers an update run).
+### Holding packages
+Held packages (local `HOLD_PKGS` + holds set in the web UI, globally or per server) are passed to your commands
+as the environment variable `NU_IGNORE` (comma separated). The default command uses it:
+```
+pacman -Syu --noconfirm ${NU_IGNORE:+--ignore "$NU_IGNORE"}
+```
+If you change `COMMANDS`, keep that part, otherwise holds are not applied.
+
+## Web UI
+- Status of every server (online / offline / running), last seen
+- Pending updates (held packages are struck through)
+- Hold packages per server or on all servers
+- "Update now" starts a run within `POLL_INTERVAL` seconds
+- Output of the last run
+
+## Security
+- The server cannot run arbitrary commands on agents. It only sends "update now" and package names;
+  what runs is defined solely by the local `COMMANDS`.
+- Traffic is plain HTTP with a shared token. That is meant for a trusted home network.
+  Put a reverse proxy with TLS in front of it if you need more.
+- Anyone with `ADMIN_PASSWORD` can trigger updates on all linked servers.
 
 ## Logs
 ```
 journalctl -u next-update -f
+journalctl -u next-update-server -f
 ```
