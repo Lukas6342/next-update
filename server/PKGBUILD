@@ -1,0 +1,23 @@
+# Maintainer: Lukas6342
+pkgname=next-update-server
+pkgver=0.4.0
+pkgrel=1
+pkgdesc='Auto update daemon for servers (systemd), optionally controlled by next-update-web'
+arch=('any')
+url='https://github.com/Lukas6342/next-update'
+license=('MIT')
+depends=('systemd' 'curl' 'pacman-contrib')
+optdepends=('yay: AUR updates'
+            'docker: Docker image updates'
+            'docker-buildx: detect Docker image updates'
+            'docker-compose: recreate compose containers after an image update')
+backup=('etc/next-update-server/config')
+source=('next-update-server' 'next-update-server.service' 'next-update-server.conf')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm755 next-update-server "$pkgdir/usr/bin/next-update-server"
+    install -Dm644 next-update-server.service "$pkgdir/usr/lib/systemd/system/next-update-server.service"
+    install -Dm600 next-update-server.conf "$pkgdir/etc/next-update-server/config"
+    install -Dm644 "$startdir/../LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

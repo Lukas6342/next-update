@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# next-update - auto update daemon for servers (systemd)
-# Logs go to stdout/stderr -> journalctl -u next-update
-# Optional: reports to / takes "update now", selected updates and package holds from next-update-server.
-# The server can never run arbitrary commands: it only sends "run COMMANDS" or a selection of items,
-# and the agent only updates items that are in its own current pending list.
+# next-update-server - auto update daemon for servers (systemd)
+# Logs go to stdout/stderr -> journalctl -u next-update-server
+# Optional: reports to / takes "update all", selected updates and package holds from next-update-web.
+# The web ui can never run arbitrary commands: it only sends "run COMMANDS" or a selection of items,
+# and the daemon only updates items that are in its own current pending list.
 
 set -u
 export LC_ALL=C
-CONFIG="${NEXT_UPDATE_CONFIG:-/etc/next-update/config}"
+CONFIG="${NEXT_UPDATE_CONFIG:-/etc/next-update-server/config}"
 
 log() { echo "$*"; }
 err() { echo "<3>$*"; }   # journald priority "err"
@@ -19,8 +19,8 @@ load_config() {
     STOP_ON_ERROR=no
     HOLD_PKGS=()
     COMMANDS=()
-    SERVER_URL=""
-    SERVER_TOKEN=""
+    WEB_URL=""
+    TOKEN=""
     HOST_NAME="$HOSTNAME"
     POLL_INTERVAL=10
     CHECK_INTERVAL=900
@@ -34,7 +34,7 @@ load_config() {
     [[ $POLL_INTERVAL =~ ^[0-9]+$ ]] && ((POLL_INTERVAL >= 2)) || POLL_INTERVAL=10
     [[ $CHECK_INTERVAL =~ ^[0-9]+$ ]] && ((CHECK_INTERVAL >= 60)) || CHECK_INTERVAL=900
     [[ $DOCKER_CHECK_INTERVAL =~ ^[0-9]+$ ]] && ((DOCKER_CHECK_INTERVAL >= 600)) || DOCKER_CHECK_INTERVAL=21600
-    SERVER_URL=${SERVER_URL%/}
+    WEB_URL=${WEB_URL%/}
 }
 
 # ---------------------------------------------------------------- full run (COMMANDS from config)
@@ -228,18 +228,18 @@ run_selected() {
 
 # ---------------------------------------------------------------- server link
 
-# tell the server we are alive + pending list, fetch holds and run requests
+# tell the web ui we are alive + pending list, fetch holds and run requests
 poll_server() {
     local resp k v w
     SRV_RUN=0
     SRV_ITEMS=()
     resp=$(cat "$PEND_PACMAN" "$PEND_AUR" "$PEND_DOCKER" | curl -fsS --max-time 10 -X POST \
-        -H "Authorization: Bearer $SERVER_TOKEN" -H "X-Status: $STATUS" \
-        --data-binary @- "$SERVER_URL/api/poll?host=$HOST_NAME" 2>&1) || {
-        if ((SRV_OK)); then err "server: ${resp:-request failed}"; SRV_OK=0; fi
+        -H "Authorization: Bearer $TOKEN" -H "X-Status: $STATUS" \
+        --data-binary @- "$WEB_URL/api/poll?host=$HOST_NAME" 2>&1) || {
+        if ((SRV_OK)); then err "web ui: ${resp:-request failed}"; SRV_OK=0; fi
         return 1
     }
-    if ((!SRV_OK)); then log "server reachable again"; SRV_OK=1; fi
+    if ((!SRV_OK)); then log "web ui reachable again"; SRV_OK=1; fi
     SRV_HOLD=()
     while read -r k v w; do
         case $k in
@@ -258,17 +258,17 @@ poll_server() {
 
 send_log() {
     tail -c 65536 "$LOG_FILE" | sed 's/^<[0-7]>//' | curl -fsS --max-time 20 -X POST \
-        -H "Authorization: Bearer $SERVER_TOKEN" -H "X-Result: $1" \
-        --data-binary @- "$SERVER_URL/api/log?host=$HOST_NAME" >/dev/null 2>&1 \
-        || err "could not send log to server"
+        -H "Authorization: Bearer $TOKEN" -H "X-Result: $1" \
+        --data-binary @- "$WEB_URL/api/log?host=$HOST_NAME" >/dev/null 2>&1 \
+        || err "could not send log to web ui"
 }
 
 # $1 = function to run: run_updates | run_selected
 do_run() {
     local rc
-    if [[ -n $SERVER_URL ]]; then
+    if [[ -n $WEB_URL ]]; then
         STATUS=running
-        poll_server   # announce "running" (the server hands out no requests then), fetch holds
+        poll_server   # announce "running" (the web ui hands out no requests then), fetch holds
     fi
     local all=("${HOLD_PKGS[@]}" "${SRV_HOLD[@]}")
     export NU_IGNORE
@@ -279,7 +279,7 @@ do_run() {
     rc=${PIPESTATUS[0]}
 
     STATUS=idle
-    if [[ -n $SERVER_URL ]]; then
+    if [[ -n $WEB_URL ]]; then
         refresh_all
         send_log "$( ((rc)) && echo failed || echo ok )"
     fi
@@ -289,8 +289,8 @@ do_run() {
 
 load_config || exit 1
 
-if [[ -n $SERVER_URL ]]; then
-    log "server: $SERVER_URL as $HOST_NAME"
+if [[ -n $WEB_URL ]]; then
+    log "web ui: $WEB_URL as $HOST_NAME"
     refresh_all
     poll_server
 fi
@@ -301,15 +301,15 @@ sig=""
 while true; do
     load_config || { sleep 60; continue; }
 
-    if [[ -n $SERVER_URL ]]; then
+    if [[ -n $WEB_URL ]]; then
         poll_server
         if ((SRV_RUN)); then
             if ((SRV_RUN == 2)); then
                 SEL=("${SRV_ITEMS[@]}")
-                log "selective update requested via server (${#SEL[@]} items)"
+                log "selective update requested via web ui (${#SEL[@]} items)"
                 do_run run_selected
             else
-                log "update requested via server"
+                log "update requested via web ui"
                 do_run run_updates
             fi
             continue

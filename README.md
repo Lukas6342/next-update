@@ -1,39 +1,37 @@
 # next-update
-Auto update daemon for Arch-based GNU/Linux servers (systemd, pacman packages), with an optional central web UI.
+Auto update for Arch-based GNU/Linux servers (systemd, pacman packages) with an optional central web UI.
 
-Two packages are built from this repo:
+Two separate packages:
 
-| Package | What it is |
-|---|---|
-| `next-update` | Agent, runs on every server. Runs your update commands on boot and/or on a schedule. |
-| `next-update-server` | Central web UI, runs on **one** server. Shows all agents, holds back packages, triggers updates. |
-
-The agent also works standalone, without a server.
+| Package | Folder | Runs on | What it is |
+|---|---|---|---|
+| `next-update-server` | `server/` | every server | Daemon. Runs your update commands on boot and/or on a schedule. Works standalone. |
+| `next-update-web` | `web/` | one machine | Web UI. Shows all servers, pending updates, holds, starts updates. |
 
 ## Install
 ```
 git clone https://github.com/Lukas6342/next-update
-cd next-update
-makepkg -si          # installs both; use `makepkg -s` and pacman -U to pick one
+cd next-update/server && makepkg -si     # on every server
+cd ../web && makepkg -si                 # on the machine that hosts the web UI
 ```
 
-### Agent (every server)
+### Web UI
 ```
-sudo $EDITOR /etc/next-update/config
-sudo systemctl enable --now next-update
+sudo $EDITOR /etc/next-update-web/config        # set ADMIN_USER, ADMIN_PASSWORD, TOKEN
+sudo systemctl enable --now next-update-web
 ```
+Open `http://<host>:8080` and log in with `ADMIN_USER` / `ADMIN_PASSWORD`.
+The service refuses to start while one of the three values is empty.
 
-### Web server (one server)
+### Server daemon
 ```
-sudo $EDITOR /etc/next-update-server/config     # set ADMIN_PASSWORD and AGENT_TOKEN
+sudo $EDITOR /etc/next-update-server/config     # commands, schedule; WEB_URL + TOKEN to link it to the web UI
 sudo systemctl enable --now next-update-server
 ```
-Open `http://<server>:8080`, log in with any username and `ADMIN_PASSWORD`.
-Link an agent by setting `SERVER_URL` and `SERVER_TOKEN` (= `AGENT_TOKEN`) in its config and restarting it.
-It then shows up in the UI by its hostname.
+`TOKEN` must equal `TOKEN` in the web config. The server then shows up in the UI by its hostname.
 
-## Agent config
-`/etc/next-update/config` (bash syntax):
+## Server config
+`/etc/next-update-server/config` (bash syntax):
 
 | Option | Meaning |
 |---|---|
@@ -43,12 +41,15 @@ It then shows up in the UI by its hostname.
 | `STOP_ON_ERROR` | `yes`/`no` - stop at first failing command |
 | `HOLD_PKGS` | bash array of packages that are never updated on this server |
 | `COMMANDS` | bash array of commands, run in order |
-| `SERVER_URL`, `SERVER_TOKEN` | link to next-update-server (optional) |
+| `WEB_URL`, `TOKEN` | link to next-update-web (optional) |
 | `HOST_NAME` | name in the UI, default: hostname |
-| `POLL_INTERVAL` | seconds between server polls, default 10 |
+| `POLL_INTERVAL` | seconds between polls of the web UI, default 10 |
 | `CHECK_INTERVAL` | seconds between pacman/AUR pending-update checks, default 900 |
 | `AUR_USER` | user that runs yay, empty = no AUR updates |
 | `DOCKER_CHECK`, `DOCKER_CHECK_INTERVAL` | Docker image checks, default `yes` / 21600 s |
+
+Schedule/command changes are picked up after the next run; restart the service to apply them immediately
+(with `RUN_ON_BOOT=yes` this triggers an update run).
 
 ### Holding packages
 Held packages (local `HOLD_PKGS` + holds set in the web UI, globally or per server) are passed to your commands
@@ -61,13 +62,13 @@ If you change `COMMANDS`, keep that part, otherwise holds are not applied.
 ## Web UI
 - Status of every server (online / offline / running), last seen
 - Pending updates per server, grouped: **Pacman**, **AUR (yay)**, **Docker images** (held packages are struck through)
-- Tick single entries and press **Update selected**, or press **Update all** (runs the `COMMANDS` from the agent config)
+- Tick single entries and press **Update selected**, or press **Update all** (runs the `COMMANDS` from the server's config)
 - Hold packages per server or on all servers
 - A request starts within `POLL_INTERVAL` seconds
 - Output of the last run
 
 ### What "Update selected" does
-| Kind | Command run by the agent |
+| Kind | Command run by the daemon |
 |---|---|
 | Pacman | `pacman -Sy --noconfirm -- <packages>` |
 | AUR | `yay -S --noconfirm -- <packages>` as `AUR_USER` |
@@ -78,22 +79,22 @@ Selecting a library without its dependents can break the system. The UI asks bef
 Use "Update all" for normal maintenance.
 
 ### AUR and Docker setup
-- AUR: install `yay`, set `AUR_USER` in the agent config. That user needs passwordless `sudo` for pacman.
+- AUR: install `yay`, set `AUR_USER` in the server config. That user needs passwordless `sudo` for pacman.
 - Docker: install `docker-buildx` (used to read the registry digest) and `docker-compose`.
   Only images of existing containers are checked. Locally built images and digest-pinned (`@sha256:`) images are skipped.
   Registries are queried every `DOCKER_CHECK_INTERVAL` seconds (default 6 h) and after every update run,
   because Docker Hub limits anonymous requests.
 
 ## Security
-- The server cannot run arbitrary commands on agents. It only sends "update all" or a selection of names.
-  "Update all" runs only the local `COMMANDS`; for a selection the agent updates only items that are in its
-  own current pending list, so the server cannot make it install anything else.
-- Traffic is plain HTTP with a shared token. That is meant for a trusted home network.
+- The web UI cannot run arbitrary commands on servers. It only sends "update all" or a selection of names.
+  "Update all" runs only the local `COMMANDS`; for a selection the daemon updates only items that are in its
+  own current pending list, so the web UI cannot make it install anything else.
+- Traffic is plain HTTP with a shared token and a basic-auth login. That is meant for a trusted home network.
   Put a reverse proxy with TLS in front of it if you need more.
-- Anyone with `ADMIN_PASSWORD` can trigger updates on all linked servers.
+- Anyone with the web login can trigger updates on all linked servers.
 
 ## Logs
 ```
-journalctl -u next-update -f
 journalctl -u next-update-server -f
+journalctl -u next-update-web -f
 ```

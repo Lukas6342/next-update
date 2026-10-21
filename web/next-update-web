@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""next-update-server - central web UI for next-update agents (stdlib only)."""
+"""next-update-web - central web UI for the next-update-server daemons (stdlib only)."""
 import base64
 import hmac
 import json
@@ -14,8 +14,9 @@ from urllib.parse import parse_qs, urlparse
 
 LISTEN = os.environ.get("LISTEN", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
+ADMIN_USER = os.environ.get("ADMIN_USER", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
-AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
+TOKEN = os.environ.get("TOKEN", "")
 DB_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "."), "state.db")
 MAX_BODY = 1 << 20
 HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -143,16 +144,19 @@ class Handler(BaseHTTPRequestHandler):
                 given = base64.b64decode(h[6:]).decode()
             except Exception:
                 given = ""
-            if hmac.compare_digest(given.partition(":")[2].encode(), ADMIN_PASSWORD.encode()):
+            user, _, password = given.partition(":")
+            user_ok = hmac.compare_digest(user.encode(), ADMIN_USER.encode())
+            pass_ok = hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode())
+            if user_ok and pass_ok:
                 return True
         self.send(401, "login required\n", headers={"WWW-Authenticate": 'Basic realm="next-update"'})
         return False
 
     def agent(self):
         h = self.headers.get("Authorization", "")
-        if h.startswith("Bearer ") and hmac.compare_digest(h[7:].encode(), AGENT_TOKEN.encode()):
+        if h.startswith("Bearer ") and hmac.compare_digest(h[7:].encode(), TOKEN.encode()):
             return True
-        print("rejected agent request from %s (bad token)" % self.client_address[0], flush=True)
+        print("rejected request from a server at %s (bad token)" % self.client_address[0], flush=True)
         self.send(401, "bad token\n")
         return False
 
@@ -331,7 +335,7 @@ function hostCard(h,s){
   return el('section',{class:'card'},
     el('div',{class:'head'},el('h2',{},h.name),el('span',{class:'badge '+state},state),el('span',{class:'mut'},'seen '+ago(age)),el('span',{class:'sp'}),
       el('button',{disabled:busy||!set.size,onclick:runSel},h.run_requested&&h.queued?'Queued...':'Update selected ('+set.size+')'),
-      el('button',{class:'pri',title:"Runs the COMMANDS from the agent's config",disabled:busy,onclick:()=>act('/api/run',{host:h.name})},h.run_requested&&!h.queued?'Queued...':'Update all'),
+      el('button',{class:'pri',title:"Runs the COMMANDS from the server's config",disabled:busy,onclick:()=>act('/api/run',{host:h.name})},h.run_requested&&!h.queued?'Queued...':'Update all'),
       state==='offline'?el('button',{onclick:()=>{if(confirm('Remove '+h.name+'?'))act('/api/delete',{host:h.name})}},'Remove'):null),
     pend,
     el('div',{class:'lbl'},'Held on this server'),holds(h.name,h.holds),
@@ -341,7 +345,7 @@ function render(s){
   last=s;
   $('#app').replaceChildren(
     el('section',{class:'card'},el('h2',{},'Held on all servers'),el('div',{class:'lbl'},'Skipped by pacman (--ignore) on every server.'),holds('',s.global)),
-    ...(s.hosts.length?s.hosts.map(h=>hostCard(h,s)):[el('p',{class:'mut'},'No agents yet. Set SERVER_URL and SERVER_TOKEN in /etc/next-update/config and restart next-update.')]));
+    ...(s.hosts.length?s.hosts.map(h=>hostCard(h,s)):[el('p',{class:'mut'},'No servers yet. Set WEB_URL and TOKEN in /etc/next-update-server/config and restart next-update-server.')]));
 }
 async function load(){
   const a=document.activeElement;if(a&&a.tagName==='INPUT'&&a.type==='text')return;
@@ -353,8 +357,8 @@ setInterval(load,5000);load();
 
 
 def main():
-    if not ADMIN_PASSWORD or not AGENT_TOKEN:
-        sys.exit("ADMIN_PASSWORD and AGENT_TOKEN must be set in /etc/next-update-server/config")
+    if not ADMIN_USER or not ADMIN_PASSWORD or not TOKEN:
+        sys.exit("ADMIN_USER, ADMIN_PASSWORD and TOKEN must be set in /etc/next-update-web/config")
     init_db()
     srv = ThreadingHTTPServer((LISTEN, PORT), Handler)
     print("listening on %s:%d" % (LISTEN, PORT), flush=True)

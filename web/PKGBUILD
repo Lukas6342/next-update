@@ -1,0 +1,19 @@
+# Maintainer: Lukas6342
+pkgname=next-update-web
+pkgver=0.4.0
+pkgrel=1
+pkgdesc='Central web UI for next-update-server: status, pending updates, holds, selective updates'
+arch=('any')
+url='https://github.com/Lukas6342/next-update'
+license=('MIT')
+depends=('python' 'systemd')
+backup=('etc/next-update-web/config')
+source=('next-update-web' 'next-update-web.service' 'next-update-web.conf')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm755 next-update-web "$pkgdir/usr/bin/next-update-web"
+    install -Dm644 next-update-web.service "$pkgdir/usr/lib/systemd/system/next-update-web.service"
+    install -Dm600 next-update-web.conf "$pkgdir/etc/next-update-web/config"
+    install -Dm644 "$startdir/../LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,18 +1,18 @@
 [Unit]
-Description=next-update central web server
+Description=next-update-web central web UI
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
 DynamicUser=yes
-StateDirectory=next-update-server
-EnvironmentFile=/etc/next-update-server/config
+StateDirectory=next-update-web
+EnvironmentFile=/etc/next-update-web/config
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/next-update-server
+ExecStart=/usr/bin/next-update-web
 Restart=on-failure
 RestartSec=5
-SyslogIdentifier=next-update-server
+SyslogIdentifier=next-update-web
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
