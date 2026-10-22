@@ -11,9 +11,8 @@ Two separate packages:
 
 ## Install
 ```
-git clone https://github.com/Lukas6342/next-update
-cd next-update/server && makepkg -si     # on every server
-cd ../web && makepkg -si                 # on the machine that hosts the web UI
+Download the needed files from the release section. 
+Install them on Arch via pacman -F filename
 ```
 
 ### Web UI
