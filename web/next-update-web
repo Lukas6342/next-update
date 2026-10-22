@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""next-update-web - central web UI for the next-update-server daemons (stdlib only)."""
+"""next-update-web - modern central web UI for next-update-server daemons (stdlib only)."""
 import base64
 import hmac
 import json
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import subprocess
@@ -61,12 +62,14 @@ def init_db():
                 last_run REAL, last_result TEXT, last_log TEXT, ip TEXT);
             CREATE TABLE IF NOT EXISTS holds(
                 host TEXT NOT NULL, pkg TEXT NOT NULL, PRIMARY KEY(host, pkg));
+            CREATE TABLE IF NOT EXISTS sessions(
+                token TEXT PRIMARY KEY, created_at REAL, user TEXT);
             """
         )
         cols = [r["name"] for r in c.execute("PRAGMA table_info(hosts)")]
-        if "run_items" not in cols:   # database from version 0.2.0
+        if "run_items" not in cols:
             c.execute("ALTER TABLE hosts ADD COLUMN run_items TEXT")
-        if "ip" not in cols:          # database from version 0.5.0
+        if "ip" not in cols:
             c.execute("ALTER TABLE hosts ADD COLUMN ip TEXT")
 
 
@@ -98,7 +101,7 @@ def state():
         "global": holds.get("", []),
         "hosts": hosts,
         "rejections": recent_rej,
-        "server_info": {"listen": LISTEN, "port": PORT}
+        "server_info": {"listen": LISTEN, "port": PORT, "user": ADMIN_USER}
     }
 
 
@@ -219,7 +222,7 @@ def check_target(raw_target, default_port=8080):
                 "detail": r["detail"]
             })
 
-    # Fast ICMP Ping test (timeout 1s)
+    # Fast ICMP Ping test (timeout 1.5s)
     try:
         cmd = ["ping", "-c", "1", "-W", "1", result["resolved_ip"]]
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5)
@@ -272,7 +275,7 @@ def check_target(raw_target, default_port=8080):
         result["summary"] = f"{target} is the local machine, but next-update-server has not checked in yet."
         result["advice"] = f"Set WEB_URL=\"http://127.0.0.1:{default_port}\" and TOKEN in /etc/next-update-server/config, then run: sudo systemctl restart next-update-server."
     else:
-        result["summary"] = f"No response from {target} (ping timed out, ports closed)."
+        result["summary"] = f"No response from {target} (ping timed out, probe ports closed)."
         result["advice"] = "Check that the IP is correct, the server is powered on, and firewall allows connections."
 
     return result
@@ -302,7 +305,27 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("body too large")
         return self.rfile.read(n)
 
-    def admin(self):
+    def get_session_token(self):
+        cookie_header = self.headers.get("Cookie", "")
+        for part in cookie_header.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "session":
+                return v.strip()
+        return ""
+
+    def admin(self, is_api=False):
+        # 1. Check session cookie
+        sess = self.get_session_token()
+        if sess:
+            with conn() as c:
+                row = c.execute("SELECT user, created_at FROM sessions WHERE token=?", (sess,)).fetchone()
+                if row:
+                    if time.time() - row["created_at"] < 30 * 86400:
+                        return True
+                    else:
+                        c.execute("DELETE FROM sessions WHERE token=?", (sess,))
+
+        # 2. Check HTTP Basic Auth (for curl or legacy scripts)
         h = self.headers.get("Authorization", "")
         if h.startswith("Basic "):
             try:
@@ -314,7 +337,16 @@ class Handler(BaseHTTPRequestHandler):
             pass_ok = hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode())
             if user_ok and pass_ok:
                 return True
-        self.send(401, "login required\n", headers={"WWW-Authenticate": 'Basic realm="next-update"'})
+
+        # Unauthenticated response
+        if is_api:
+            self.send(401, json.dumps({"error": "login required"}), "application/json")
+        else:
+            self.send(200, LOGIN_PAGE, "text/html; charset=utf-8", {
+                "Content-Security-Policy":
+                    "default-src 'none'; script-src 'unsafe-inline'; "
+                    "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:"
+            })
         return False
 
     def agent(self):
@@ -331,15 +363,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
+        if u.path == "/login":
+            return self.send(200, LOGIN_PAGE, "text/html; charset=utf-8")
+
+        if u.path == "/logout":
+            sess = self.get_session_token()
+            if sess:
+                with conn() as c:
+                    c.execute("DELETE FROM sessions WHERE token=?", (sess,))
+            return self.send(302, "", headers={"Location": "/", "Set-Cookie": "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"})
+
         if u.path not in ("/", "/api/state", "/api/log"):
             return self.send(404, "not found\n")
-        if not self.admin():
+
+        is_api = u.path.startswith("/api/")
+        if not self.admin(is_api=is_api):
             return
+
         if u.path == "/":
             return self.send(200, PAGE, "text/html; charset=utf-8", {
                 "Content-Security-Policy":
                     "default-src 'none'; script-src 'unsafe-inline'; "
-                    "style-src 'unsafe-inline'; connect-src 'self'"})
+                    "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:"})
         if u.path == "/api/state":
             return self.send(200, json.dumps(state()), "application/json")
         host = (parse_qs(u.query).get("host") or [""])[0]
@@ -350,6 +395,35 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         try:
+            # Login endpoint (no admin check)
+            if u.path == "/api/login":
+                if not self.headers.get("Content-Type", "").startswith("application/json"):
+                    return self.send(415, "json required\n")
+                req = json.loads(self.body() or b"{}")
+                user = (req.get("user") or "").strip()
+                password = req.get("password") or ""
+                user_ok = hmac.compare_digest(user.encode(), ADMIN_USER.encode())
+                pass_ok = hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode())
+                if user_ok and pass_ok:
+                    token = secrets.token_hex(32)
+                    with conn() as c:
+                        c.execute("INSERT INTO sessions(token, created_at, user) VALUES(?, ?, ?)",
+                                  (token, time.time(), user))
+                    return self.send(200, json.dumps({"ok": True}), "application/json", headers={
+                        "Set-Cookie": f"session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
+                    })
+                return self.send(401, json.dumps({"error": "Invalid username or password"}), "application/json")
+
+            if u.path == "/api/logout":
+                sess = self.get_session_token()
+                if sess:
+                    with conn() as c:
+                        c.execute("DELETE FROM sessions WHERE token=?", (sess,))
+                return self.send(200, json.dumps({"ok": True}), "application/json", headers={
+                    "Set-Cookie": "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+                })
+
+            # Agent check-in endpoints
             if u.path in ("/api/poll", "/api/log"):
                 if not self.agent():
                     return
@@ -366,9 +440,10 @@ class Handler(BaseHTTPRequestHandler):
                 agent_log(host, result, data[-65536:])
                 return self.send(200, "ok\n")
 
+            # Admin management endpoints
             if u.path not in ("/api/hold", "/api/run", "/api/delete", "/api/check"):
                 return self.send(404, "not found\n")
-            if not self.admin():
+            if not self.admin(is_api=True):
                 return
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 return self.send(415, "json required\n")
@@ -413,76 +488,434 @@ class Handler(BaseHTTPRequestHandler):
             self.send(400, "bad request: %s\n" % e)
 
 
+LOGIN_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>next-update — Sign In</title>
+<style>
+:root {
+  --bg: #0b0f17;
+  --card: #131b26;
+  --card-border: #222f3e;
+  --fg: #f1f5f9;
+  --mut: #94a3b8;
+  --acc: #3b82f6;
+  --acc-hover: #2563eb;
+  --bad: #f87171;
+  --bad-bg: rgba(239, 68, 68, 0.12);
+  --bad-border: rgba(239, 68, 68, 0.3);
+  --input-bg: #0b111a;
+  --input-border: #2d3c4d;
+  --radius: 14px;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f8fafc;
+    --card: #ffffff;
+    --card-border: #e2e8f0;
+    --fg: #0f172a;
+    --mut: #64748b;
+    --acc: #2563eb;
+    --acc-hover: #1d4ed8;
+    --bad: #dc2626;
+    --bad-bg: #fef2f2;
+    --bad-border: #fecaca;
+    --input-bg: #f8fafc;
+    --input-border: #cbd5e1;
+  }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background-image: radial-gradient(circle at 50% 15%, rgba(59, 130, 246, 0.12) 0%, transparent 65%);
+}
+.login-card {
+  width: 100%;
+  max-width: 390px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius);
+  padding: 34px 28px;
+  box-shadow: 0 20px 25px -5px rgba(0,0,0,0.3), 0 8px 10px -6px rgba(0,0,0,0.2);
+}
+.logo-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin-bottom: 26px;
+  text-align: center;
+}
+.logo-icon {
+  width: 54px;
+  height: 54px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  margin-bottom: 14px;
+  box-shadow: 0 6px 18px rgba(37, 99, 235, 0.35);
+}
+h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
+.sub { font-size: 13px; color: var(--mut); margin-top: 4px; }
+.err-box {
+  background: var(--bad-bg);
+  border: 1px solid var(--bad-border);
+  color: var(--bad);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  margin-bottom: 18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.field { margin-bottom: 16px; }
+label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--mut); margin-bottom: 6px; }
+.input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.input-wrap svg {
+  position: absolute;
+  left: 12px;
+  color: var(--mut);
+  pointer-events: none;
+}
+input {
+  width: 100%;
+  padding: 11px 12px 11px 38px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--fg);
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: 8px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+input:focus {
+  border-color: var(--acc);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+}
+button {
+  width: 100%;
+  padding: 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--acc);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  margin-top: 6px;
+  transition: background 0.15s, transform 0.05s;
+}
+button:hover { background: var(--acc-hover); }
+button:active { transform: scale(0.99); }
+button:disabled { opacity: 0.6; cursor: default; }
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="logo-wrap">
+    <div class="logo-icon">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>
+    </div>
+    <h1>next-update</h1>
+    <div class="sub">Central Server Management</div>
+  </div>
+  <div id="err" class="err-box" style="display:none">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg>
+    <span id="err-text">Invalid username or password</span>
+  </div>
+  <form id="login-form">
+    <div class="field">
+      <label for="u">Username</label>
+      <div class="input-wrap">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <input id="u" type="text" autocomplete="username" required autofocus placeholder="Admin username">
+      </div>
+    </div>
+    <div class="field">
+      <label for="p">Password</label>
+      <div class="input-wrap">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <input id="p" type="password" autocomplete="current-password" required placeholder="Admin password">
+      </div>
+    </div>
+    <button type="submit" id="btn">Sign In</button>
+  </form>
+</div>
+<script>
+const f = document.getElementById('login-form');
+const btn = document.getElementById('btn');
+const errBox = document.getElementById('err');
+const errText = document.getElementById('err-text');
+f.onsubmit = async e => {
+  e.preventDefault();
+  errBox.style.display = 'none';
+  btn.disabled = true;
+  btn.textContent = 'Signing in...';
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({user: f.u.value.trim(), password: f.p.value})
+    });
+    if (res.ok) {
+      window.location.href = '/';
+    } else {
+      const data = await res.json().catch(() => ({}));
+      errText.textContent = data.error || 'Login failed';
+      errBox.style.display = 'flex';
+      btn.disabled = false;
+      btn.textContent = 'Sign In';
+      f.p.value = '';
+      f.p.focus();
+    }
+  } catch(e) {
+    errText.textContent = 'Server connection failed';
+    errBox.style.display = 'flex';
+    btn.disabled = false;
+    btn.textContent = 'Sign In';
+  }
+};
+</script>
+</body>
+</html>
+"""
+
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>next-update</title>
+<title>next-update — Dashboard</title>
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--fg:#1b1f24;--mut:#6a737d;--line:#e1e4e8;--acc:#2563eb;--ok:#16a34a;--bad:#dc2626;--warn:#d97706}
-@media(prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#161b22;--fg:#e6edf3;--mut:#8b949e;--line:#30363d;--acc:#4c8dff;--ok:#3fb950;--bad:#f85149;--warn:#d29922}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
-main{max-width:860px;margin:0 auto;padding:16px}
-h1{font-size:20px;margin:8px 0 16px}
-h2{font-size:16px;margin:0}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
-.head{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:8px}
+:root{
+  --bg:#f8fafc;--card:#ffffff;--line:#e2e8f0;--fg:#0f172a;--mut:#64748b;--mut-bg:#f1f5f9;
+  --acc:#2563eb;--acc-hover:#1d4ed8;--ok:#10b981;--ok-bg:#ecfdf5;--bad:#ef4444;--bad-bg:#fef2f2;
+  --warn:#f59e0b;--warn-bg:#fffbeb;--shadow:0 4px 6px -1px rgb(0 0 0 / 0.06), 0 2px 4px -2px rgb(0 0 0 / 0.06);
+  --shadow-lg:0 10px 15px -3px rgb(0 0 0 / 0.08), 0 4px 6px -4px rgb(0 0 0 / 0.08);--radius:12px;
+}
+@media(prefers-color-scheme:dark){
+  :root{
+    --bg:#0b0f17;--card:#131b26;--line:#222f3e;--fg:#f1f5f9;--mut:#94a3b8;--mut-bg:#1a2534;
+    --acc:#3b82f6;--acc-hover:#60a5fa;--ok:#34d399;--ok-bg:#064e3b33;--bad:#f87171;--bad-bg:#7f1d1d33;
+    --warn:#fbbf24;--warn-bg:#78350f33;--shadow:0 4px 6px -1px rgb(0 0 0 / 0.25);--shadow-lg:0 10px 15px -3px rgb(0 0 0 / 0.35);
+  }
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh}
+
+/* Top Navbar */
+header{position:sticky;top:0;z-index:40;background:var(--card);border-bottom:1px solid var(--line);backdrop-filter:blur(8px);box-shadow:var(--shadow)}
+.nav-wrap{max-width:980px;margin:0 auto;padding:12px 18px;display:flex;align-items:center;gap:14px}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--fg);font-weight:700;font-size:17px;letter-spacing:-0.02em}
+.brand-icon{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);display:flex;align-items:center;justify-content:center;color:#fff}
+.live-badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;background:var(--ok-bg);color:var(--ok);border:1px solid currentColor}
+.live-dot{width:6px;height:6px;border-radius:99px;background:var(--ok);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(0.85)}}
 .sp{flex:1}
+.user-pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut);background:var(--mut-bg);padding:4px 10px;border-radius:99px;border:1px solid var(--line)}
+.btn-logout{background:none;border:1px solid var(--line);color:var(--mut);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;transition:all 0.15s}
+.btn-logout:hover{color:var(--bad);border-color:var(--bad);background:var(--bad-bg)}
+
+/* Main Container */
+main{max-width:980px;margin:0 auto;padding:22px 18px 48px}
+
+/* Metrics Grid */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:18px}
+.stat-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px;box-shadow:var(--shadow)}
+.stat-lbl{font-size:12px;font-weight:600;color:var(--mut);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px}
+.stat-val{font-size:24px;font-weight:700;display:flex;align-items:baseline;gap:8px}
+.stat-sub{font-size:12px;color:var(--mut);font-weight:normal}
+
+/* Cards */
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:18px;box-shadow:var(--shadow);transition:border-color 0.15s}
+.card:hover{border-color:color-mix(in srgb, var(--line) 70%, var(--acc))}
+.head{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:12px}
+h2{font-size:16px;font-weight:600;display:flex;align-items:center;gap:8px}
 .mut{color:var(--mut);font-size:13px}
-.lbl{color:var(--mut);font-size:13px;margin:10px 0 4px}
-.badge{font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid currentColor}
-.badge.online{color:var(--ok)}.badge.offline{color:var(--bad)}.badge.running{color:var(--warn)}
-button,input{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 10px}
-input[type=checkbox]{padding:0;width:auto;margin:0}
-button{cursor:pointer}button:disabled{opacity:.5;cursor:default}
-button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
-.holds{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-.chip{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:99px;padding:1px 4px 1px 10px;font-family:monospace;font-size:13px}
-.chip button{border:0;background:none;padding:0 6px;color:var(--mut)}
-.add{display:flex;gap:6px;flex-wrap:wrap}
-details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
-.pend{margin-top:6px;max-height:420px;overflow:auto}
-.grp{display:flex;gap:8px;align-items:center;margin:10px 0 4px;font-weight:600}
-.row{display:flex;gap:8px;align-items:baseline;padding:1px 0;font-family:monospace;font-size:13px;cursor:pointer}
-.row .d{color:var(--mut)}
+.lbl{color:var(--mut);font-size:13px;margin:8px 0 4px}
+
+/* Badges */
+.badge{font-size:12px;font-weight:500;padding:2px 10px;border-radius:99px;border:1px solid currentColor;display:inline-flex;align-items:center;gap:5px}
+.badge.online{color:var(--ok);background:var(--ok-bg)}
+.badge.offline{color:var(--bad);background:var(--bad-bg)}
+.badge.running{color:var(--warn);background:var(--warn-bg)}
+
+/* Controls & Buttons */
+button,input{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 12px;outline:none}
+button{cursor:pointer;font-weight:500;display:inline-flex;align-items:center;justify-content:center;gap:6px;transition:all 0.15s}
+button:hover{filter:brightness(0.95)}
+button:disabled{opacity:0.5;cursor:default}
+button.pri{background:linear-gradient(135deg,var(--acc),var(--acc-hover));border-color:var(--acc);color:#fff;box-shadow:0 2px 4px rgba(37,99,235,0.25)}
+button.pri:hover{filter:brightness(1.08)}
+button.danger{color:var(--bad);border-color:var(--bad);background:transparent}
+button.danger:hover{background:var(--bad-bg)}
+
+/* Holds */
+.holds{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px}
+.chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--mut-bg);border-radius:99px;padding:2px 6px 2px 10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.chip button{border:0;background:none;padding:0 4px;color:var(--mut);font-size:14px;cursor:pointer;border-radius:99px}
+.chip button:hover{color:var(--bad)}
+.add{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+
+/* Details & Pending */
+details{margin-top:10px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+summary{padding:10px 14px;background:var(--mut-bg);cursor:pointer;font-weight:600;font-size:13px;display:flex;align-items:center;gap:8px;user-select:none}
+details[open] summary{border-bottom:1px solid var(--line)}
+.pend{padding:10px 14px;max-height:420px;overflow:auto}
+.grp{display:flex;gap:8px;align-items:center;margin:12px 0 6px;font-weight:600;font-size:13px}
+.grp-tag{font-size:11px;font-weight:700;text-transform:uppercase;padding:1px 6px;border-radius:4px;border:1px solid var(--line);background:var(--mut-bg)}
+.row{display:flex;gap:10px;align-items:baseline;padding:4px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;cursor:pointer;border-bottom:1px dashed color-mix(in srgb,var(--line) 40%,transparent)}
+.row:hover{background:var(--mut-bg)}
+.row .d{color:var(--mut);margin-left:auto}
 .row.held .nm{text-decoration:line-through;color:var(--mut)}
-pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;max-height:360px;overflow:auto;font-size:12px;white-space:pre-wrap}
-#err{color:var(--bad)}
-.alert{background:#fef2f2;border:1px solid #f87171;color:#991b1b;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px}
-@media(prefers-color-scheme:dark){.alert{background:#450a0a;border-color:#b91c1c;color:#fca5a5}}
-.check-res{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px;margin-top:10px}
-</style></head><body><main>
-<h1>next-update</h1><p id="err" hidden>Server not reachable.</p>
-<div id="alerts"></div>
-<section class="card">
-  <h2>Host & IP Checker</h2>
-  <div class="lbl">Check if a server or IP is reachable and whether next-update-server is linked.</div>
-  <form id="check-form" class="add" style="margin-top:8px" onsubmit="doCheck(event)">
-    <input id="check-inp" placeholder="e.g. 192.168.1.50 or 127.0.0.1" autocomplete="off" style="flex:1;min-width:200px;max-width:340px">
-    <button type="submit" id="check-btn">Check</button>
-  </form>
-  <div id="check-result" hidden class="check-res"></div>
-</section>
-<div id="app"></div></main>
+.held-tag{font-size:10px;padding:0 5px;background:var(--bad-bg);color:var(--bad);border-radius:3px;font-weight:700}
+
+/* Pre & Terminal Log */
+pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:12px;max-height:360px;overflow:auto;font-size:12px;line-height:1.45;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:var(--fg)}
+
+/* Checker box */
+.check-res{background:var(--mut-bg);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:13px;margin-top:12px}
+.alert{background:var(--bad-bg);border:1px solid var(--bad);color:var(--bad);border-radius:8px;padding:12px 14px;margin-bottom:18px;font-size:13px;display:flex;align-items:center;gap:10px}
+#err{background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad);padding:8px 12px;border-radius:6px;margin-bottom:12px}
+.quick-chips{display:flex;gap:6px;margin-top:6px}
+.quick-chip{font-size:11px;padding:2px 8px;border-radius:99px;background:var(--mut-bg);border:1px solid var(--line);cursor:pointer;color:var(--mut)}
+.quick-chip:hover{color:var(--acc);border-color:var(--acc)}
+</style></head><body>
+<header>
+  <div class="nav-wrap">
+    <a href="/" class="brand">
+      <div class="brand-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>
+      </div>
+      <span>next-update</span>
+    </a>
+    <span class="live-badge"><span class="live-dot"></span> Live</span>
+    <span class="sp"></span>
+    <span class="user-pill" id="user-display">👤 admin</span>
+    <a href="/logout" class="btn-logout" title="Sign Out">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></svg>
+      Logout
+    </a>
+  </div>
+</header>
+
+<main>
+  <p id="err" hidden>Server not reachable.</p>
+  <div id="alerts"></div>
+
+  <!-- Metrics Overview Bar -->
+  <div class="stats-grid" id="stats-bar">
+    <div class="stat-card">
+      <div class="stat-lbl">Connected Servers</div>
+      <div class="stat-val" id="stat-servers">0 <span class="stat-sub">online</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-lbl">Pending Updates</div>
+      <div class="stat-val" id="stat-pending" style="color:var(--acc)">0 <span class="stat-sub">packages</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-lbl">Package Holds</div>
+      <div class="stat-val" id="stat-holds">0 <span class="stat-sub">held</span></div>
+    </div>
+  </div>
+
+  <!-- Host & IP Checker Card -->
+  <section class="card">
+    <div class="head" style="margin-bottom:6px">
+      <h2>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        Host & IP Checker
+      </h2>
+      <span class="sp"></span>
+      <span class="mut" style="font-size:12px">Probe network connectivity & linking status</span>
+    </div>
+    <form id="check-form" class="add" onsubmit="doCheck(event)">
+      <input id="check-inp" placeholder="IP or hostname, e.g. 192.168.1.50 or 127.0.0.1" autocomplete="off" style="flex:1;min-width:240px">
+      <button type="submit" id="check-btn" class="pri">Probe Host</button>
+    </form>
+    <div class="quick-chips">
+      <span class="quick-chip" onclick="fillCheck('127.0.0.1')">127.0.0.1</span>
+      <span class="quick-chip" onclick="fillCheck('localhost')">localhost</span>
+    </div>
+    <div id="check-result" hidden class="check-res"></div>
+  </section>
+
+  <!-- Server List & Global Holds -->
+  <div id="app"></div>
+</main>
+
 <script>
 const $=s=>document.querySelector(s);
 const opened=new Map();
 const sel=new Map();
 let last=null;
-const el=(t,a,...k)=>{const e=document.createElement(t);for(const[n,v]of Object.entries(a||{})){if(n==='class')e.className=v;else if(n==='disabled'){if(v)e.disabled=true}else if(n.startsWith('on'))e.addEventListener(n.slice(2),v);else e.setAttribute(n,v)}e.append(...k.filter(x=>x!=null&&x!==false));return e};
-const api=async(p,b)=>{const r=await fetch(p,b?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{});if(!r.ok)throw new Error(r.status);return r};
-const ago=s=>{s=Math.max(0,Math.round(s));if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago'};
-const act=async(p,b)=>{try{await api(p,b)}catch(e){alert('Request failed: '+e.message)}if(document.activeElement)document.activeElement.blur();load()};
+
+const el=(t,a,...k)=>{
+  const e=document.createElement(t);
+  for(const[n,v]of Object.entries(a||{})){
+    if(n==='class')e.className=v;
+    else if(n==='disabled'){if(v)e.disabled=true}
+    else if(n.startsWith('on'))e.addEventListener(n.slice(2),v);
+    else e.setAttribute(n,v);
+  }
+  e.append(...k.filter(x=>x!=null&&x!==false));
+  return e;
+};
+
+const api=async(p,b)=>{
+  const r=await fetch(p,b?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{});
+  if(r.status===401){window.location.href='/login';return;}
+  if(!r.ok)throw new Error(r.status);
+  return r;
+};
+
+const ago=s=>{
+  s=Math.max(0,Math.round(s));
+  if(s<60)return s+'s ago';
+  if(s<3600)return Math.floor(s/60)+'m ago';
+  if(s<86400)return Math.floor(s/3600)+'h ago';
+  return Math.floor(s/86400)+'d ago';
+};
+
+const act=async(p,b)=>{
+  try{await api(p,b)}catch(e){alert('Request failed: '+e.message)}
+  if(document.activeElement)document.activeElement.blur();
+  load();
+};
+
 const KINDS={pacman:'Pacman',apt:'APT',aur:'AUR (yay)',docker:'Docker images'};
+
+function fillCheck(val){
+  const inp=$('#check-inp');
+  inp.value=val;
+  inp.focus();
+  $('#check-btn').click();
+}
 
 const doCheck=async e=>{
   e.preventDefault();
   const inp=$('#check-inp'),btn=$('#check-btn'),resBox=$('#check-result');
   const val=inp.value.trim();
   if(!val)return;
-  btn.disabled=true;btn.textContent='Checking...';
+  btn.disabled=true;btn.textContent='Probing...';
   resBox.hidden=false;
-  resBox.innerHTML='<span class="mut">Probing '+val+'...</span>';
+  resBox.innerHTML='<span class="mut">Testing reachability to '+val+'...</span>';
   try{
     const r=await api('/api/check',{target:val});
     const d=await r.json();
@@ -490,47 +923,52 @@ const doCheck=async e=>{
     const isRej=d.recent_rejections&&d.recent_rejections.length;
     const isReachable=d.ping_ok||(d.open_ports&&d.open_ports.length);
     const color=isOk?'var(--ok)':(isRej?'var(--bad)':(isReachable?'var(--warn)':'var(--bad)'));
-    let html='<div style="margin-bottom:4px"><strong>Result:</strong> <span style="color:'+color+'">'+d.summary+'</span></div>';
-    if(d.advice)html+='<div class="mut" style="margin-top:4px"><strong>Tip:</strong> '+d.advice+'</div>';
+    let html='<div style="margin-bottom:6px"><strong>Result:</strong> <span style="color:'+color+';font-weight:600">'+d.summary+'</span></div>';
+    if(d.advice)html+='<div class="mut" style="line-height:1.4"><strong>Tip:</strong> '+d.advice+'</div>';
     resBox.innerHTML=html;
   }catch(err){
     resBox.innerHTML='<span style="color:var(--bad)">Check failed: '+err.message+'</span>';
   }finally{
-    btn.disabled=false;btn.textContent='Check';
+    btn.disabled=false;btn.textContent='Probe Host';
   }
 };
 
 function holds(host,list){
   const inp=el('input',{placeholder:'package name',maxlength:'128',autocomplete:'off'});
-  const form=el('form',{class:'add',onsubmit:e=>{e.preventDefault();const p=inp.value.trim();if(p)act('/api/hold',{host,pkg:p,on:true})}},inp,el('button',{type:'submit'},'Hold'));
+  const form=el('form',{class:'add',onsubmit:e=>{e.preventDefault();const p=inp.value.trim();if(p)act('/api/hold',{host,pkg:p,on:true})}},
+    inp,el('button',{type:'submit'},'+ Hold'));
   return el('div',{class:'holds'},
-    ...list.map(p=>el('span',{class:'chip'},p,el('button',{title:'release',onclick:()=>act('/api/hold',{host,pkg:p,on:false})},'×'))),
+    ...list.map(p=>el('span',{class:'chip'},p,el('button',{title:'Release hold',onclick:()=>act('/api/hold',{host,pkg:p,on:false})},'×'))),
     form);
 }
+
 function det(key,dflt,sum,body,ontoggle){
   const d=el('details',{},el('summary',{},sum),body);
   d.open=opened.has(key)?opened.get(key):dflt;
   d.addEventListener('toggle',()=>{opened.set(key,d.open);if(ontoggle)ontoggle(d)});
   return d;
 }
+
 function pendingBlock(h,held,set){
   const wrap=el('div',{class:'pend'});
   for(const kind of Object.keys(KINDS)){
     const items=h.pending.filter(p=>p.kind===kind);
     if(!items.length)continue;
     const keys=items.map(p=>kind+'\t'+p.name);
-    const master=el('input',{type:'checkbox',title:'select all',onchange:e=>{keys.forEach(k=>e.target.checked?set.add(k):set.delete(k));render(last)}});
+    const master=el('input',{type:'checkbox',title:'Select all in '+KINDS[kind],onchange:e=>{keys.forEach(k=>e.target.checked?set.add(k):set.delete(k));render(last)}});
     master.checked=keys.every(k=>set.has(k));
-    wrap.append(el('div',{class:'grp'},master,KINDS[kind]+' ('+items.length+')'));
+    wrap.append(el('div',{class:'grp'},master,el('span',{class:'grp-tag'},KINDS[kind]),'('+items.length+')'));
     for(const p of items){
       const k=kind+'\t'+p.name;
+      const isHeld=held.has(p.name);
       const cb=el('input',{type:'checkbox',onchange:e=>{e.target.checked?set.add(k):set.delete(k);render(last)}});
       cb.checked=set.has(k);
-      wrap.append(el('label',{class:'row'+(held.has(p.name)?' held':'')},cb,el('span',{class:'nm'},p.name),el('span',{class:'d'},p.detail)));
+      wrap.append(el('label',{class:'row'+(isHeld?' held':'')},cb,el('span',{class:'nm'},p.name),isHeld?el('span',{class:'held-tag'},'HELD'):null,el('span',{class:'d'},p.detail)));
     }
   }
   return wrap;
 }
+
 function hostCard(h,s){
   const age=s.now-h.last_seen;
   const state=(h.status==='running'&&age<3600)?'running':age<60?'online':'offline';
@@ -540,47 +978,85 @@ function hostCard(h,s){
   for(const k of [...set])if(!keys.has(k))set.delete(k);
   const counts=Object.keys(KINDS).map(k=>[k,h.pending.filter(p=>p.kind===k).length]).filter(x=>x[1]).map(x=>x[1]+' '+x[0]).join(', ');
   const busy=state==='running'||h.run_requested;
+
   const runSel=()=>{
     const items=[...set].map(k=>{const[kind,name]=k.split('\t');return{kind,name}});
     const pm=items.filter(i=>i.kind==='pacman').length,all=h.pending.filter(p=>p.kind==='pacman').length;
     if(pm&&pm<all&&!confirm('Updating only some pacman packages is a partial upgrade. Arch does not support that and it can break the system. Continue?'))return;
     set.clear();act('/api/run',{host:h.name,items});
   };
-  const pend=h.pending.length?det('p:'+h.name,true,h.pending.length+' pending: '+counts,pendingBlock(h,held,set)):el('div',{class:'lbl'},'Up to date');
-  const pre=el('pre',{},'loading...');
-  const loadLog=()=>fetch('/api/log?host='+encodeURIComponent(h.name)).then(r=>r.text()).then(t=>{pre.textContent=t||'(empty)'}).catch(()=>{pre.textContent='failed to load'});
+
+  const pend=h.pending.length?det('p:'+h.name,true,'📦 '+h.pending.length+' pending updates ('+counts+')',pendingBlock(h,held,set)):el('div',{class:'lbl',style:'color:var(--ok)'},'✓ All packages up to date');
+  const pre=el('pre',{},'Loading output log...');
+  const loadLog=()=>fetch('/api/log?host='+encodeURIComponent(h.name)).then(r=>r.text()).then(t=>{pre.textContent=t||'(empty log)'}).catch(()=>{pre.textContent='Failed to load log'});
   const logSum='Last run: '+(h.last_result?h.last_result+', '+ago(s.now-h.last_run):'never');
+
   return el('section',{class:'card'},
     el('div',{class:'head'},
-      el('h2',{},h.name),
-      h.ip?el('span',{class:'mut',style:'font-size:12px;font-family:monospace'},'('+h.ip+')'):null,
-      el('span',{class:'badge '+state},state),el('span',{class:'mut'},'seen '+ago(age)),el('span',{class:'sp'}),
+      el('h2',{},
+        el('svg',{width:'18',height:'18',viewBox:'0 0 24 24',fill:'none',stroke:'currentColor','stroke-width':'2'},
+          el('rect',{width:'20',height:'8',x:'2',y:'2',rx:'2',ry:'2'}),el('rect',{width:'20',height:'8',x:'2',y:'14',rx:'2',ry:'2'}),el('line',{x1:'6',x2:'6.01',y1:'6',y2:'6'}),el('line',{x1:'6',x2:'6.01',y1:'18',y2:'18'})),
+        h.name),
+      h.ip?el('span',{class:'chip',style:'cursor:pointer',title:'Click to probe',onclick:()=>fillCheck(h.ip)},h.ip):null,
+      el('span',{class:'badge '+state},state),
+      el('span',{class:'mut'},'seen '+ago(age)),
+      el('span',{class:'sp'}),
       el('button',{disabled:busy||!set.size,onclick:runSel},h.run_requested&&h.queued?'Queued...':'Update selected ('+set.size+')'),
       el('button',{class:'pri',title:"Runs the COMMANDS from the server's config",disabled:busy,onclick:()=>act('/api/run',{host:h.name})},h.run_requested&&!h.queued?'Queued...':'Update all'),
-      state==='offline'?el('button',{onclick:()=>{if(confirm('Remove '+h.name+'?'))act('/api/delete',{host:h.name})}},'Remove'):null),
+      state==='offline'?el('button',{class:'danger',onclick:()=>{if(confirm('Remove server '+h.name+'?'))act('/api/delete',{host:h.name})}},'Remove'):null),
     pend,
-    el('div',{class:'lbl'},'Held on this server'),holds(h.name,h.holds),
-    h.has_log?det('l:'+h.name,false,logSum,pre,d=>{if(d.open)loadLog()}):el('div',{class:'lbl'},logSum));
+    el('div',{class:'lbl',style:'margin-top:14px'},'Held packages on this server'),holds(h.name,h.holds),
+    h.has_log?det('l:'+h.name,false,'📝 '+logSum,pre,d=>{if(d.open)loadLog()}):el('div',{class:'lbl',style:'margin-top:10px'},'📝 '+logSum));
 }
+
 function render(s){
   last=s;
+  if(s.server_info&&s.server_info.user){
+    $('#user-display').textContent='👤 '+s.server_info.user;
+  }
+  const onlineCount=s.hosts.filter(h=>(s.now-h.last_seen)<60).length;
+  const totalPending=s.hosts.reduce((a,h)=>a+h.pending.length,0);
+  const totalHolds=s.global.length+s.hosts.reduce((a,h)=>a+h.holds.length,0);
+
+  $('#stat-servers').innerHTML=onlineCount+' <span class="stat-sub">/ '+s.hosts.length+' online</span>';
+  $('#stat-pending').innerHTML=totalPending+' <span class="stat-sub">packages</span>';
+  $('#stat-holds').innerHTML=totalHolds+' <span class="stat-sub">active</span>';
+
   const alertBox=$('#alerts');
   if(s.rejections&&s.rejections.length){
     const r=s.rejections[s.rejections.length-1];
-    alertBox.innerHTML='<div class="alert">⚠️ Connection rejected from <strong>'+r.ip+'</strong> ('+r.reason+': '+r.detail+') '+ago(s.now-r.time)+'. Ensure TOKEN in /etc/next-update-server/config matches this web UI.</div>';
+    alertBox.innerHTML='<div class="alert"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg><span>Connection attempt from <strong>'+r.ip+'</strong> rejected ('+r.reason+': '+r.detail+') '+ago(s.now-r.time)+'. Check that TOKEN in /etc/next-update-server/config matches this web UI.</span></div>';
   }else{
     alertBox.innerHTML='';
   }
-  const emptyHelp='No servers linked yet. To connect, set WEB_URL="http://127.0.0.1:'+s.server_info.port+'" (for this machine) or with this machine\'s LAN IP (for remote servers) and matching TOKEN in /etc/next-update-server/config, then restart next-update-server.';
+
+  const emptyHelp='No servers linked yet. To connect, set WEB_URL="http://127.0.0.1:'+(s.server_info?s.server_info.port:8080)+'" (for this machine) or this machine\'s LAN IP (for remote servers) and matching TOKEN in /etc/next-update-server/config, then restart next-update-server.';
+
   $('#app').replaceChildren(
-    el('section',{class:'card'},el('h2',{},'Held on all servers'),el('div',{class:'lbl'},'Skipped on every server (pacman --ignore, apt hold during the run).'),holds('',s.global)),
-    ...(s.hosts.length?s.hosts.map(h=>hostCard(h,s)):[el('p',{class:'mut'},emptyHelp)]));
+    el('section',{class:'card'},
+      el('h2',{},
+        el('svg',{width:'18',height:'18',viewBox:'0 0 24 24',fill:'none',stroke:'currentColor','stroke-width':'2'},
+          el('rect',{width:'18',height:'11',x:'3',y:'11',rx:'2',ry:'2'}),el('path',{d:'M7 11V7a5 5 0 0 1 10 0v4'})),
+        'Held on all servers'),
+      el('div',{class:'lbl'},'Packages skipped on every server (pacman --ignore or apt hold during the run).'),
+      holds('',s.global)),
+    ...(s.hosts.length?s.hosts.map(h=>hostCard(h,s)):[el('p',{class:'mut',style:'text-align:center;padding:32px 16px'},emptyHelp)]));
 }
+
 async function load(){
   const a=document.activeElement;if(a&&a.tagName==='INPUT'&&a.type==='text')return;
-  try{render(await(await api('/api/state')).json());$('#err').hidden=true}catch(e){$('#err').hidden=false}
+  try{
+    const res=await api('/api/state');
+    if(!res)return;
+    render(await res.json());
+    $('#err').hidden=true;
+  }catch(e){
+    $('#err').hidden=false;
+  }
 }
-setInterval(load,5000);load();
+
+setInterval(load,5000);
+load();
 </script></body></html>
 """
 

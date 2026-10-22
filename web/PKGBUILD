@@ -1,7 +1,7 @@
 # Maintainer: Lukas6342
 pkgname=next-update-web
 pkgver=0.6.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Central web UI for next-update-server: status, pending updates, holds, selective updates'
 arch=('any')
 url='https://github.com/Lukas6342/next-update'
