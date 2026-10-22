@@ -30,6 +30,7 @@ sudo $EDITOR /etc/next-update-server/config     # commands, schedule; WEB_URL + 
 sudo systemctl enable --now next-update-server
 ```
 `TOKEN` must equal `TOKEN` in the web config. The server then shows up in the UI by its hostname.
+For a server daemon running on the **same machine** as the web UI, use `WEB_URL="http://127.0.0.1:8080"`. For remote servers, use `http://<ip-of-web-host>:8080`.
 
 ## Server config
 `/etc/next-update-server/config` (bash syntax):
@@ -72,7 +73,9 @@ pacman -Syu --noconfirm ${NU_IGNORE:+--ignore "$NU_IGNORE"}
 If you set your own `COMMANDS` on Arch, keep that part, otherwise holds are not applied.
 
 ## Web UI
-- Status of every server (online / offline / running), last seen
+- Status of every server (online / offline / running), last seen, client IP
+- **Host & IP Checker**: probe any IP/hostname from the UI to check network reachability and linking status
+- Connection diagnostic alerts if a server connects with a mismatched token or invalid hostname
 - Pending updates per server, grouped: **Pacman** or **APT**, **AUR (yay)**, **Docker images** (held packages are struck through)
 - Tick single entries and press **Update selected**, or press **Update all** (runs the `COMMANDS` from the server's config)
 - Hold packages per server or on all servers

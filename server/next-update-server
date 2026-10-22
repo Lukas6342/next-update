@@ -13,7 +13,7 @@ log() { echo "$*"; }
 err() { echo "<3>$*"; }   # journald priority "err"
 
 load_config() {
-    RUN_ON_BOOT=yes
+    RUN_ON_BOOT=no
     UPDATE_TIME=""
     UPDATE_DAYS="all"
     STOP_ON_ERROR=no
@@ -21,7 +21,7 @@ load_config() {
     COMMANDS=()
     WEB_URL=""
     TOKEN=""
-    HOST_NAME="$HOSTNAME"
+    HOST_NAME=""
     POLL_INTERVAL=10
     CHECK_INTERVAL=900
     AUR_USER=""
@@ -44,7 +44,29 @@ load_config() {
     [[ $POLL_INTERVAL =~ ^[0-9]+$ ]] && ((POLL_INTERVAL >= 2)) || POLL_INTERVAL=10
     [[ $CHECK_INTERVAL =~ ^[0-9]+$ ]] && ((CHECK_INTERVAL >= 60)) || CHECK_INTERVAL=900
     [[ $DOCKER_CHECK_INTERVAL =~ ^[0-9]+$ ]] && ((DOCKER_CHECK_INTERVAL >= 600)) || DOCKER_CHECK_INTERVAL=21600
-    WEB_URL=${WEB_URL%/}
+
+    # Clean and normalize WEB_URL
+    WEB_URL=$(echo "${WEB_URL:-}" | sed -e 's/^[[:space:]"'\''"]*//' -e 's/[[:space:]"'\''"]*$//' -e 's#/*$##')
+    if [[ -n $WEB_URL ]]; then
+        [[ $WEB_URL != http://* && $WEB_URL != https://* ]] && WEB_URL="http://$WEB_URL"
+        # 0.0.0.0 is not a valid destination address for a client
+        WEB_URL="${WEB_URL//0.0.0.0/127.0.0.1}"
+    fi
+
+    # Clean TOKEN
+    TOKEN=$(echo "${TOKEN:-}" | sed -e 's/^[[:space:]"'\''"]*//' -e 's/[[:space:]"'\''"]*$//')
+
+    # Determine and sanitize HOST_NAME
+    local def_host
+    def_host=$(uname -n 2>/dev/null || hostname 2>/dev/null || echo "server")
+    def_host=${def_host%%.*}
+    if [[ -z ${HOST_NAME:-} || $HOST_NAME == *'$'* ]]; then
+        HOST_NAME="$def_host"
+    fi
+    HOST_NAME=$(echo "$HOST_NAME" | tr -cd 'A-Za-z0-9._-')
+    HOST_NAME="${HOST_NAME:0:64}"
+    [[ -z $HOST_NAME ]] && HOST_NAME="server"
+    return 0
 }
 
 # ---------------------------------------------------------------- full run (COMMANDS from config)
@@ -75,6 +97,13 @@ apt_hold_end() {
 run_updates() {
     local c rc failed=0
     log "update run started"
+    if [[ $DEBIAN_MODE != yes && -f /var/lib/pacman/db.lck ]]; then
+        if pgrep -x pacman >/dev/null 2>&1; then
+            err "pacman is currently locked by another running process (/var/lib/pacman/db.lck)"
+        else
+            err "stale pacman lock file found at /var/lib/pacman/db.lck"
+        fi
+    fi
     [[ $DEBIAN_MODE == yes ]] && apt_hold_start
     for c in "${COMMANDS[@]}"; do
         log "running: $c"
@@ -297,17 +326,58 @@ run_selected() {
 
 # tell the web ui we are alive + pending list, fetch holds and run requests
 poll_server() {
-    local resp k v w
+    local http_code curl_rc body
     SRV_RUN=0
     SRV_ITEMS=()
-    resp=$(cat "$PEND_PACMAN" "$PEND_APT" "$PEND_AUR" "$PEND_DOCKER" | curl -fsS --max-time 10 -X POST \
-        -H "Authorization: Bearer $TOKEN" -H "X-Status: $STATUS" \
-        --data-binary @- "$WEB_URL/api/poll?host=$HOST_NAME" 2>&1) || {
-        if ((SRV_OK)); then err "web ui: ${resp:-request failed}"; SRV_OK=0; fi
+    [[ -z $WEB_URL ]] && return 0
+    if [[ -z $TOKEN ]]; then
+        if ((SRV_OK)); then
+            err "web ui ($WEB_URL): TOKEN is not set in $CONFIG"
+            SRV_OK=0
+        fi
         return 1
-    }
-    if ((!SRV_OK)); then log "web ui reachable again"; SRV_OK=1; fi
+    fi
+
+    local tmp_resp
+    tmp_resp=$(mktemp -p "$PEND_DIR")
+    http_code=$(cat "$PEND_PACMAN" "$PEND_APT" "$PEND_AUR" "$PEND_DOCKER" | curl -sS --max-time 10 \
+        -w "%{http_code}" -o "$tmp_resp" -X POST \
+        -H "Authorization: Bearer $TOKEN" -H "X-Status: $STATUS" \
+        --data-binary @- "$WEB_URL/api/poll?host=$HOST_NAME" 2>&1)
+    curl_rc=$?
+
+    if ((curl_rc != 0)); then
+        if ((SRV_OK)); then
+            case $curl_rc in
+                7)  err "web ui: connection refused at $WEB_URL - is next-update-web running?" ;;
+                28) err "web ui: connection timed out to $WEB_URL - check IP, port and firewall" ;;
+                *)  err "web ui: connection failed to $WEB_URL (curl exit $curl_rc: $http_code)" ;;
+            esac
+            SRV_OK=0
+        fi
+        rm -f "$tmp_resp"
+        return 1
+    fi
+
+    if [[ $http_code != 200 ]]; then
+        body=$(head -n 2 "$tmp_resp" 2>/dev/null | tr -d '\r\n')
+        rm -f "$tmp_resp"
+        if ((SRV_OK)); then
+            if [[ $http_code == 401 ]]; then
+                err "web ui: authentication failed (HTTP 401: bad token) at $WEB_URL - check that TOKEN in $CONFIG matches web UI"
+            elif [[ $http_code == 400 ]]; then
+                err "web ui: request rejected (HTTP 400: ${body:-bad request}) - host: '$HOST_NAME'"
+            else
+                err "web ui: HTTP $http_code from $WEB_URL: ${body:-unknown error}"
+            fi
+            SRV_OK=0
+        fi
+        return 1
+    fi
+
+    if ((!SRV_OK)); then log "web ui reachable ($WEB_URL)"; SRV_OK=1; fi
     SRV_HOLD=()
+    local k v w
     while read -r k v w; do
         case $k in
             hold) [[ $v =~ ^[A-Za-z0-9][A-Za-z0-9@._+:-]*$ ]] && SRV_HOLD+=("$v") ;;
@@ -319,15 +389,21 @@ poll_server() {
                     SRV_ITEMS+=("$v $w")
                 fi ;;
         esac
-    done <<<"$resp"
+    done <"$tmp_resp"
+    rm -f "$tmp_resp"
     return 0
 }
 
 send_log() {
-    tail -c 65536 "$LOG_FILE" | sed 's/^<[0-7]>//' | curl -fsS --max-time 20 -X POST \
+    [[ -z $WEB_URL || -z $TOKEN ]] && return 0
+    local http_code
+    http_code=$(tail -c 65536 "$LOG_FILE" | sed 's/^<[0-7]>//' | curl -sS --max-time 20 \
+        -w "%{http_code}" -o /dev/null -X POST \
         -H "Authorization: Bearer $TOKEN" -H "X-Result: $1" \
-        --data-binary @- "$WEB_URL/api/log?host=$HOST_NAME" >/dev/null 2>&1 \
-        || err "could not send log to web ui"
+        --data-binary @- "$WEB_URL/api/log?host=$HOST_NAME" 2>&1)
+    if [[ $http_code != 200 ]]; then
+        err "could not send log to web ui (HTTP ${http_code:-failed})"
+    fi
 }
 
 # $1 = function to run: run_updates | run_selected
@@ -358,8 +434,12 @@ load_config || exit 1
 
 if [[ -n $WEB_URL ]]; then
     log "web ui: $WEB_URL as $HOST_NAME"
-    refresh_all
+    poll_server   # register immediately with web UI so we appear as online
+    refresh_fast
     poll_server
+    if [[ $DOCKER_CHECK == yes ]]; then
+        ( refresh_docker && poll_server ) >/dev/null 2>&1 &
+    fi
 fi
 [[ $RUN_ON_BOOT == yes ]] && do_run run_updates
 

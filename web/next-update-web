@@ -5,24 +5,39 @@ import hmac
 import json
 import os
 import re
+import socket
 import sqlite3
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-LISTEN = os.environ.get("LISTEN", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "8080"))
-ADMIN_USER = os.environ.get("ADMIN_USER", "")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
-TOKEN = os.environ.get("TOKEN", "")
-DB_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "."), "state.db")
+LISTEN = os.environ.get("LISTEN", "0.0.0.0").strip().strip("'\"")
+PORT = int(os.environ.get("PORT", "8080").strip().strip("'\""))
+ADMIN_USER = os.environ.get("ADMIN_USER", "").strip().strip("'\"")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip().strip("'\"")
+TOKEN = os.environ.get("TOKEN", "").strip().strip("'\"")
+DB_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", ".").strip().strip("'\""), "state.db")
 MAX_BODY = 1 << 20
 HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+:-]{0,127}$")
 IMG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,254}$")
 KINDS = ("pacman", "apt", "aur", "docker")
+
+REJECTIONS = []  # list of {"time": float, "ip": str, "reason": str, "detail": str}
+
+
+def record_rejection(ip, reason, detail=""):
+    REJECTIONS.append({
+        "time": time.time(),
+        "ip": ip,
+        "reason": reason,
+        "detail": detail
+    })
+    if len(REJECTIONS) > 50:
+        REJECTIONS.pop(0)
 
 
 @contextmanager
@@ -43,7 +58,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS hosts(
                 name TEXT PRIMARY KEY, last_seen REAL, status TEXT, pending TEXT,
                 run_requested INTEGER NOT NULL DEFAULT 0, run_items TEXT,
-                last_run REAL, last_result TEXT, last_log TEXT);
+                last_run REAL, last_result TEXT, last_log TEXT, ip TEXT);
             CREATE TABLE IF NOT EXISTS holds(
                 host TEXT NOT NULL, pkg TEXT NOT NULL, PRIMARY KEY(host, pkg));
             """
@@ -51,6 +66,8 @@ def init_db():
         cols = [r["name"] for r in c.execute("PRAGMA table_info(hosts)")]
         if "run_items" not in cols:   # database from version 0.2.0
             c.execute("ALTER TABLE hosts ADD COLUMN run_items TEXT")
+        if "ip" not in cols:          # database from version 0.5.0
+            c.execute("ALTER TABLE hosts ADD COLUMN ip TEXT")
 
 
 def parse_pending(text):
@@ -66,7 +83,7 @@ def state():
     now = time.time()
     with conn() as c:
         hosts = [dict(r) for r in c.execute(
-            "SELECT name,last_seen,status,pending,run_requested,run_items,last_run,last_result,"
+            "SELECT name,last_seen,status,pending,run_requested,run_items,last_run,last_result,ip,"
             "last_log IS NOT NULL AND last_log != '' AS has_log FROM hosts ORDER BY name")]
         holds = {}
         for r in c.execute("SELECT host,pkg FROM holds ORDER BY pkg"):
@@ -75,16 +92,23 @@ def state():
         h["pending"] = parse_pending(h["pending"])
         h["queued"] = len((h.pop("run_items") or "").splitlines())   # 0 = full run
         h["holds"] = holds.get(h["name"], [])
-    return {"now": now, "global": holds.get("", []), "hosts": hosts}
+    recent_rej = [r for r in REJECTIONS if now - r["time"] < 900]
+    return {
+        "now": now,
+        "global": holds.get("", []),
+        "hosts": hosts,
+        "rejections": recent_rej,
+        "server_info": {"listen": LISTEN, "port": PORT}
+    }
 
 
-def agent_poll(host, status, pending):
+def agent_poll(host, status, pending, client_ip):
     with conn() as c:
         c.execute(
-            "INSERT INTO hosts(name,last_seen,status,pending) VALUES(?,?,?,?) "
+            "INSERT INTO hosts(name,last_seen,status,pending,ip) VALUES(?,?,?,?,?) "
             "ON CONFLICT(name) DO UPDATE SET last_seen=excluded.last_seen,"
-            "status=excluded.status,pending=excluded.pending",
-            (host, time.time(), status, pending[:262144]))
+            "status=excluded.status,pending=excluded.pending,ip=excluded.ip",
+            (host, time.time(), status, pending[:262144], client_ip))
         row = c.execute("SELECT run_requested,run_items FROM hosts WHERE name=?", (host,)).fetchone()
         run = bool(row["run_requested"]) and status != "running"   # nothing is handed out mid-run
         if run:
@@ -111,6 +135,147 @@ def valid_item(it):
     if not isinstance(name, str):
         return False
     return bool((kind in ("pacman", "apt", "aur") and PKG_RE.match(name)) or (kind == "docker" and IMG_RE.match(name)))
+
+
+def check_target(raw_target, default_port=8080):
+    raw_target = (raw_target or "").strip()
+    if raw_target.startswith("http://"):
+        raw_target = raw_target[7:]
+    elif raw_target.startswith("https://"):
+        raw_target = raw_target[8:]
+    raw_target = raw_target.split("/")[0]
+
+    custom_port = None
+    if ":" in raw_target and not raw_target.startswith("["):
+        host, _, p = raw_target.partition(":")
+        if p.isdigit():
+            raw_target = host
+            custom_port = int(p)
+    elif raw_target.startswith("[") and "]" in raw_target:
+        host = raw_target[1:raw_target.index("]")]
+        rest = raw_target[raw_target.index("]") + 1:]
+        if rest.startswith(":") and rest[1:].isdigit():
+            custom_port = int(rest[1:])
+        raw_target = host
+
+    target = raw_target
+    now = time.time()
+    result = {
+        "target": target,
+        "resolved_ip": target,
+        "is_local": False,
+        "ping_ok": False,
+        "open_ports": [],
+        "matched_hosts": [],
+        "recent_rejections": [],
+        "summary": "",
+        "advice": ""
+    }
+
+    if not target:
+        result["summary"] = "No IP or hostname provided."
+        return result
+
+    try:
+        addrinfo = socket.getaddrinfo(target, None)
+        resolved_ips = list(dict.fromkeys(a[4][0] for a in addrinfo))
+        if resolved_ips:
+            result["resolved_ip"] = resolved_ips[0]
+    except Exception:
+        result["resolved_ip"] = target
+
+    target_ips = set(filter(None, [target, result["resolved_ip"]]))
+
+    local_candidates = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
+    try:
+        my_hostname = socket.gethostname()
+        local_candidates.add(my_hostname)
+        for a in socket.getaddrinfo(my_hostname, None):
+            local_candidates.add(a[4][0])
+    except Exception:
+        pass
+
+    if target in local_candidates or result["resolved_ip"] in local_candidates:
+        result["is_local"] = True
+
+    # Check known hosts in database
+    with conn() as c:
+        for r in c.execute("SELECT name, ip, status, last_seen FROM hosts"):
+            if r["ip"] in target_ips or r["name"].lower() == target.lower():
+                seen_ago = round(now - (r["last_seen"] or 0))
+                result["matched_hosts"].append({
+                    "name": r["name"],
+                    "ip": r["ip"],
+                    "status": r["status"],
+                    "seen_ago": seen_ago
+                })
+
+    # Check recent rejections
+    for r in REJECTIONS:
+        if (r["ip"] in target_ips or target in r["ip"]) and now - r["time"] < 3600:
+            result["recent_rejections"].append({
+                "time_ago": round(now - r["time"]),
+                "reason": r["reason"],
+                "detail": r["detail"]
+            })
+
+    # Fast ICMP Ping test (timeout 1s)
+    try:
+        cmd = ["ping", "-c", "1", "-W", "1", result["resolved_ip"]]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5)
+        if res.returncode == 0:
+            result["ping_ok"] = True
+    except Exception:
+        pass
+
+    # Check common ports: SSH (22), Web (default_port), HTTP (80), HTTPS (443)
+    probe_ports = [22, default_port, 80, 443]
+    if custom_port and custom_port not in probe_ports:
+        probe_ports.insert(0, custom_port)
+
+    is_ipv6 = ":" in result["resolved_ip"]
+    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+
+    for p in probe_ports:
+        try:
+            s = socket.socket(af, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            rc = s.connect_ex((result["resolved_ip"], p))
+            s.close()
+            if rc == 0:
+                result["open_ports"].append(p)
+        except Exception:
+            pass
+
+    # Build human-readable summary and advice
+    if result["matched_hosts"]:
+        h = result["matched_hosts"][0]
+        status_str = "online" if h["seen_ago"] < 60 else ("running" if h["status"] == "running" else "offline")
+        result["summary"] = f"Server '{h['name']}' is linked ({h['ip'] or target}, last seen {h['seen_ago']}s ago, {status_str})."
+        result["advice"] = "The daemon is actively communicating with this web UI."
+    elif result["recent_rejections"]:
+        rej = result["recent_rejections"][-1]
+        result["summary"] = f"Connection attempted from this IP {rej['time_ago']}s ago, but was REJECTED ({rej['reason']}: {rej['detail']})!"
+        result["advice"] = "Check that TOKEN in /etc/next-update-server/config on that machine matches TOKEN in /etc/next-update-web/config."
+    elif result["ping_ok"] or result["open_ports"]:
+        details = []
+        if result["ping_ok"]:
+            details.append("ping responded")
+        if result["open_ports"]:
+            details.append("open ports: " + ", ".join(str(p) for p in result["open_ports"]))
+        result["summary"] = f"Host {target} is REACHABLE ({', '.join(details)}), but next-update-server is not linked yet."
+        if result["is_local"]:
+            result["advice"] = f"This is the local machine. In /etc/next-update-server/config set WEB_URL=\"http://127.0.0.1:{default_port}\" and matching TOKEN, then run: sudo systemctl restart next-update-server."
+        else:
+            result["advice"] = f"On that server, edit /etc/next-update-server/config: set WEB_URL=\"http://<web-ip>:{default_port}\" and matching TOKEN, then run: sudo systemctl restart next-update-server."
+    elif result["is_local"]:
+        result["summary"] = f"{target} is the local machine, but next-update-server has not checked in yet."
+        result["advice"] = f"Set WEB_URL=\"http://127.0.0.1:{default_port}\" and TOKEN in /etc/next-update-server/config, then run: sudo systemctl restart next-update-server."
+    else:
+        result["summary"] = f"No response from {target} (ping timed out, ports closed)."
+        result["advice"] = "Check that the IP is correct, the server is powered on, and firewall allows connections."
+
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -154,9 +319,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def agent(self):
         h = self.headers.get("Authorization", "")
-        if h.startswith("Bearer ") and hmac.compare_digest(h[7:].encode(), TOKEN.encode()):
+        token_given = h[7:].strip().strip("'\"") if h.startswith("Bearer ") else ""
+        client_ip = self.client_address[0]
+        if h.startswith("Bearer ") and hmac.compare_digest(token_given.encode(), TOKEN.encode()):
             return True
-        print("rejected request from a server at %s (bad token)" % self.client_address[0], flush=True)
+        reason = "missing Bearer prefix" if not h.startswith("Bearer ") else "token mismatch"
+        record_rejection(client_ip, "bad token", reason)
+        print("rejected request from a server at %s (%s)" % (client_ip, reason), flush=True)
         self.send(401, "bad token\n")
         return False
 
@@ -185,23 +354,33 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.agent():
                     return
                 host = (parse_qs(u.query).get("host") or [""])[0]
+                client_ip = self.client_address[0]
                 if not HOST_RE.match(host):
+                    record_rejection(client_ip, "bad host", f"invalid host name '{host}'")
                     return self.send(400, "bad host\n")
                 data = self.body().decode("utf-8", "replace")
                 if u.path == "/api/poll":
                     status = "running" if self.headers.get("X-Status") == "running" else "idle"
-                    return self.send(200, agent_poll(host, status, data))
+                    return self.send(200, agent_poll(host, status, data, client_ip))
                 result = "ok" if self.headers.get("X-Result") == "ok" else "failed"
                 agent_log(host, result, data[-65536:])
                 return self.send(200, "ok\n")
 
-            if u.path not in ("/api/hold", "/api/run", "/api/delete"):
+            if u.path not in ("/api/hold", "/api/run", "/api/delete", "/api/check"):
                 return self.send(404, "not found\n")
             if not self.admin():
                 return
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 return self.send(415, "json required\n")
+
             req = json.loads(self.body() or b"{}")
+
+            if u.path == "/api/check":
+                target = req.get("target", "")
+                if not isinstance(target, str) or len(target) > 128:
+                    return self.send(400, "bad target\n")
+                return self.send(200, json.dumps(check_target(target, PORT)), "application/json")
+
             host = req.get("host", "")
             if not isinstance(host, str) or not (host == "" and u.path == "/api/hold" or HOST_RE.match(host)):
                 return self.send(400, "bad host\n")
@@ -260,7 +439,7 @@ button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
 .holds{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .chip{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:99px;padding:1px 4px 1px 10px;font-family:monospace;font-size:13px}
 .chip button{border:0;background:none;padding:0 6px;color:var(--mut)}
-.add{display:flex;gap:6px}
+.add{display:flex;gap:6px;flex-wrap:wrap}
 details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
 .pend{margin-top:6px;max-height:420px;overflow:auto}
 .grp{display:flex;gap:8px;align-items:center;margin:10px 0 4px;font-weight:600}
@@ -269,8 +448,22 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
 .row.held .nm{text-decoration:line-through;color:var(--mut)}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;max-height:360px;overflow:auto;font-size:12px;white-space:pre-wrap}
 #err{color:var(--bad)}
+.alert{background:#fef2f2;border:1px solid #f87171;color:#991b1b;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px}
+@media(prefers-color-scheme:dark){.alert{background:#450a0a;border-color:#b91c1c;color:#fca5a5}}
+.check-res{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px;margin-top:10px}
 </style></head><body><main>
-<h1>next-update</h1><p id="err" hidden>Server not reachable.</p><div id="app"></div></main>
+<h1>next-update</h1><p id="err" hidden>Server not reachable.</p>
+<div id="alerts"></div>
+<section class="card">
+  <h2>Host & IP Checker</h2>
+  <div class="lbl">Check if a server or IP is reachable and whether next-update-server is linked.</div>
+  <form id="check-form" class="add" style="margin-top:8px" onsubmit="doCheck(event)">
+    <input id="check-inp" placeholder="e.g. 192.168.1.50 or 127.0.0.1" autocomplete="off" style="flex:1;min-width:200px;max-width:340px">
+    <button type="submit" id="check-btn">Check</button>
+  </form>
+  <div id="check-result" hidden class="check-res"></div>
+</section>
+<div id="app"></div></main>
 <script>
 const $=s=>document.querySelector(s);
 const opened=new Map();
@@ -281,6 +474,31 @@ const api=async(p,b)=>{const r=await fetch(p,b?{method:'POST',headers:{'Content-
 const ago=s=>{s=Math.max(0,Math.round(s));if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago'};
 const act=async(p,b)=>{try{await api(p,b)}catch(e){alert('Request failed: '+e.message)}if(document.activeElement)document.activeElement.blur();load()};
 const KINDS={pacman:'Pacman',apt:'APT',aur:'AUR (yay)',docker:'Docker images'};
+
+const doCheck=async e=>{
+  e.preventDefault();
+  const inp=$('#check-inp'),btn=$('#check-btn'),resBox=$('#check-result');
+  const val=inp.value.trim();
+  if(!val)return;
+  btn.disabled=true;btn.textContent='Checking...';
+  resBox.hidden=false;
+  resBox.innerHTML='<span class="mut">Probing '+val+'...</span>';
+  try{
+    const r=await api('/api/check',{target:val});
+    const d=await r.json();
+    const isOk=d.matched_hosts&&d.matched_hosts.length;
+    const isRej=d.recent_rejections&&d.recent_rejections.length;
+    const isReachable=d.ping_ok||(d.open_ports&&d.open_ports.length);
+    const color=isOk?'var(--ok)':(isRej?'var(--bad)':(isReachable?'var(--warn)':'var(--bad)'));
+    let html='<div style="margin-bottom:4px"><strong>Result:</strong> <span style="color:'+color+'">'+d.summary+'</span></div>';
+    if(d.advice)html+='<div class="mut" style="margin-top:4px"><strong>Tip:</strong> '+d.advice+'</div>';
+    resBox.innerHTML=html;
+  }catch(err){
+    resBox.innerHTML='<span style="color:var(--bad)">Check failed: '+err.message+'</span>';
+  }finally{
+    btn.disabled=false;btn.textContent='Check';
+  }
+};
 
 function holds(host,list){
   const inp=el('input',{placeholder:'package name',maxlength:'128',autocomplete:'off'});
@@ -333,7 +551,10 @@ function hostCard(h,s){
   const loadLog=()=>fetch('/api/log?host='+encodeURIComponent(h.name)).then(r=>r.text()).then(t=>{pre.textContent=t||'(empty)'}).catch(()=>{pre.textContent='failed to load'});
   const logSum='Last run: '+(h.last_result?h.last_result+', '+ago(s.now-h.last_run):'never');
   return el('section',{class:'card'},
-    el('div',{class:'head'},el('h2',{},h.name),el('span',{class:'badge '+state},state),el('span',{class:'mut'},'seen '+ago(age)),el('span',{class:'sp'}),
+    el('div',{class:'head'},
+      el('h2',{},h.name),
+      h.ip?el('span',{class:'mut',style:'font-size:12px;font-family:monospace'},'('+h.ip+')'):null,
+      el('span',{class:'badge '+state},state),el('span',{class:'mut'},'seen '+ago(age)),el('span',{class:'sp'}),
       el('button',{disabled:busy||!set.size,onclick:runSel},h.run_requested&&h.queued?'Queued...':'Update selected ('+set.size+')'),
       el('button',{class:'pri',title:"Runs the COMMANDS from the server's config",disabled:busy,onclick:()=>act('/api/run',{host:h.name})},h.run_requested&&!h.queued?'Queued...':'Update all'),
       state==='offline'?el('button',{onclick:()=>{if(confirm('Remove '+h.name+'?'))act('/api/delete',{host:h.name})}},'Remove'):null),
@@ -343,9 +564,17 @@ function hostCard(h,s){
 }
 function render(s){
   last=s;
+  const alertBox=$('#alerts');
+  if(s.rejections&&s.rejections.length){
+    const r=s.rejections[s.rejections.length-1];
+    alertBox.innerHTML='<div class="alert">⚠️ Connection rejected from <strong>'+r.ip+'</strong> ('+r.reason+': '+r.detail+') '+ago(s.now-r.time)+'. Ensure TOKEN in /etc/next-update-server/config matches this web UI.</div>';
+  }else{
+    alertBox.innerHTML='';
+  }
+  const emptyHelp='No servers linked yet. To connect, set WEB_URL="http://127.0.0.1:'+s.server_info.port+'" (for this machine) or with this machine\'s LAN IP (for remote servers) and matching TOKEN in /etc/next-update-server/config, then restart next-update-server.';
   $('#app').replaceChildren(
     el('section',{class:'card'},el('h2',{},'Held on all servers'),el('div',{class:'lbl'},'Skipped on every server (pacman --ignore, apt hold during the run).'),holds('',s.global)),
-    ...(s.hosts.length?s.hosts.map(h=>hostCard(h,s)):[el('p',{class:'mut'},'No servers yet. Set WEB_URL and TOKEN in /etc/next-update-server/config and restart next-update-server.')]));
+    ...(s.hosts.length?s.hosts.map(h=>hostCard(h,s)):[el('p',{class:'mut'},emptyHelp)]));
 }
 async function load(){
   const a=document.activeElement;if(a&&a.tagName==='INPUT'&&a.type==='text')return;
@@ -356,12 +585,37 @@ setInterval(load,5000);load();
 """
 
 
+class DualStackServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except (AttributeError, OSError):
+            pass
+        super().server_bind()
+
+
 def main():
     if not ADMIN_USER or not ADMIN_PASSWORD or not TOKEN:
         sys.exit("ADMIN_USER, ADMIN_PASSWORD and TOKEN must be set in /etc/next-update-web/config")
     init_db()
-    srv = ThreadingHTTPServer((LISTEN, PORT), Handler)
-    print("listening on %s:%d" % (LISTEN, PORT), flush=True)
+
+    srv = None
+    if LISTEN in ("0.0.0.0", "::"):
+        try:
+            srv = DualStackServer(("::", PORT), Handler)
+            print("listening on [::]:%d (dual-stack IPv4/IPv6)" % PORT, flush=True)
+        except Exception:
+            srv = None
+
+    if srv is None:
+        try:
+            srv = ThreadingHTTPServer((LISTEN, PORT), Handler)
+            print("listening on %s:%d" % (LISTEN, PORT), flush=True)
+        except Exception as e:
+            sys.exit("Failed to bind on %s:%d: %s" % (LISTEN, PORT, e))
+
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

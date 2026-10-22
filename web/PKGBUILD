@@ -1,6 +1,6 @@
 # Maintainer: Lukas6342
 pkgname=next-update-web
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc='Central web UI for next-update-server: status, pending updates, holds, selective updates'
 arch=('any')

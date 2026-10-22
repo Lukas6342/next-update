@@ -1,6 +1,6 @@
 # Maintainer: Lukas6342
 pkgname=next-update-server
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc='Auto update daemon for servers (systemd), optionally controlled by next-update-web'
 arch=('any')
